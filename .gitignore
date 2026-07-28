@@ -1,0 +1,27 @@
+# Scraped HTML cache (regenerable, large)
+.cache/
+
+# Generated output
+*.epub
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Windows/WSL NTFS zone-identifier metadata (created when files are downloaded via a mounted drive)
+*:Zone.Identifier
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
