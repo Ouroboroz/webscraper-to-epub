@@ -30,7 +30,7 @@ from .epub_writer import build_epub
 from .fetcher import HEADERS, fetch
 from .scrape import scrape_chapters
 from .sites import PROFILES, resolve_profile
-from .util import get_base_url, slugify
+from .util import epub_path, get_base_url
 
 
 def main():
@@ -86,7 +86,7 @@ def main():
         print("Could not auto-detect chapter count. Use --end N to set it manually.")
         sys.exit(1)
 
-    output_file = args.output or slugify(novel_title)
+    output_file = args.output or epub_path(novel_title, args.start, end)
     chapter_range = range(args.start, end + 1)
 
     print(f"Range  : {args.start}–{end}  ({len(chapter_range)} chapters)")

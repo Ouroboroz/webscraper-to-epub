@@ -1,8 +1,9 @@
 import re
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
-from .profile import ChapterResult, IndexResult
+from .profile import ChapterResult, IndexResult, SearchResult
 from .util import get_base_url
 
 
@@ -90,3 +91,39 @@ def parse_chapter(profile, html, n):
         paragraphs.append(f"<p>{text}</p>")
 
     return ChapterResult(title, "\n".join(paragraphs))
+
+
+def search_novels(profile, session, query):
+    """Query a site's search feature for novels matching `query`. Returns a
+    list[SearchResult]. Raises NotImplementedError if the site profile hasn't
+    declared search support (neither search_fn nor search_url is set)."""
+    if profile.search_fn is not None:
+        return profile.search_fn(session, query)
+
+    if not profile.search_url:
+        raise NotImplementedError(f"Site '{profile.site_key}' does not support search.")
+
+    payload = {**profile.search_extra_params, profile.search_query_param: query}
+    if profile.search_method == "post":
+        r = session.post(profile.search_url, data=payload, timeout=15)
+    else:
+        r = session.get(profile.search_url, params=payload, timeout=15)
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    results = []
+    for item in soup.select(profile.search_result_selector):
+        link = item.select_one(profile.search_link_selector)
+        if not link or not link.get("href"):
+            continue
+        title = link.get("title") or link.get_text(strip=True)
+        url = urljoin(profile.search_base_url or "", link["href"])
+
+        chapters = None
+        if profile.search_chapter_count_pattern:
+            m = re.search(profile.search_chapter_count_pattern, item.get_text(" "))
+            if m:
+                chapters = int(m.group(1))
+
+        results.append(SearchResult(title, url, chapters))
+    return results

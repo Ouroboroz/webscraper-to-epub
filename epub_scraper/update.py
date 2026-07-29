@@ -7,9 +7,14 @@ Usage:
   python -m epub_scraper.update list [--library FILE]
   python -m epub_scraper.update check [--library FILE] [--cache-dir DIR] [--delay SECS]
                                        [--novel-delay SECS] [--only SITE:CHAPTER_ID ...] [--dry-run]
+  python -m epub_scraper.update search <query> [--library FILE]
+  python -m epub_scraper.update find <query> [--site KEY] [--limit N]
+  python -m epub_scraper.update grep <query> [--epubs-dir DIR] [--case-sensitive] [--context N]
 """
 
 import argparse
+import glob
+import os
 import sys
 import time
 
@@ -22,7 +27,8 @@ from .library import (DEFAULT_LIBRARY_PATH, add_novel, load_library, record_chec
                        remove_novel, save_library)
 from .scrape import scrape_chapters
 from .sites import PROFILES, resolve_profile
-from .util import get_base_url, slugify
+from .textsearch import search_epub_text
+from .util import EPUB_DIR, epub_path, get_base_url
 
 # Consecutive real chapter-fetch failures that abort a novel's fetch for this run.
 CIRCUIT_BREAKER_THRESHOLD = 3
@@ -56,11 +62,12 @@ def cmd_add(args):
         sys.exit(1)
 
     library = load_library(args.library)
-    output_file = args.output or slugify(title)
+    last_known = args.last_known if args.last_known is not None else 0
+    output_file = args.output or epub_path(title, 1, last_known)
     try:
         entry = add_novel(library, site_key=profile.site_key, chapter_id=chapter_id,
                            index_url=args.url, title=title, output_file=output_file,
-                           last_known_chapter=args.last_known if args.last_known is not None else 0)
+                           last_known_chapter=last_known)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
@@ -81,17 +88,89 @@ def cmd_remove(args):
         sys.exit(1)
 
 
-def cmd_list(args):
-    library = load_library(args.library)
-    if not library["novels"]:
-        print("No tracked novels.")
-        return
-    for entry in library["novels"]:
+def _print_novels(entries):
+    for entry in entries:
         status = "enabled" if entry["enabled"] else "DISABLED"
         failed = f"  failed={entry['failed_chapters']}" if entry["failed_chapters"] else ""
         err = f"  error={entry['last_error']!r}" if entry["last_error"] else ""
         print(f"{entry['site_key']}:{entry['chapter_id']}  [{status}]  "
               f"ch {entry['last_known_chapter']}  {entry['title']!r}{failed}{err}")
+
+
+def cmd_list(args):
+    library = load_library(args.library)
+    if not library["novels"]:
+        print("No tracked novels.")
+        return
+    _print_novels(library["novels"])
+
+
+def cmd_search(args):
+    library = load_library(args.library)
+    query = args.query.lower()
+    matches = [e for e in library["novels"] if query in e["title"].lower()]
+    if not matches:
+        print(f"No tracked novels matching {args.query!r}.")
+        return
+    _print_novels(matches)
+
+
+def cmd_find(args):
+    if args.site:
+        profiles = [PROFILES[args.site]]
+    else:
+        profiles = list(PROFILES.values())
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    any_results = False
+    for profile in profiles:
+        try:
+            results = engine.search_novels(profile, session, args.query)
+        except NotImplementedError:
+            continue
+        except Exception as e:
+            print(f"[{profile.site_key}] search failed: {e}")
+            continue
+
+        if not results:
+            continue
+        any_results = True
+        print(f"\n{profile.site_key}:")
+        for r in results[:args.limit]:
+            chapters = f"{r.chapters} ch" if r.chapters is not None else "? ch"
+            print(f"  {r.title}  [{chapters}]")
+            print(f"    {r.url}")
+
+    if not any_results:
+        print("No results.")
+
+
+def cmd_grep(args):
+    if not os.path.isdir(args.epubs_dir):
+        print(f"No epubs directory found at {args.epubs_dir!r}")
+        sys.exit(1)
+
+    paths = sorted(glob.glob(os.path.join(args.epubs_dir, "*.epub")))
+    if not paths:
+        print(f"No .epub files found in {args.epubs_dir!r}")
+        return
+
+    total_hits = 0
+    for path in paths:
+        hits = search_epub_text(path, args.query, ignore_case=not args.case_sensitive,
+                                 context=args.context)
+        if not hits:
+            continue
+        plural = "es" if len(hits) != 1 else ""
+        print(f"\n{os.path.basename(path)}  ({len(hits)} match{plural})")
+        for hit in hits:
+            print(f"  {hit.chapter_title}: …{hit.snippet}…")
+        total_hits += len(hits)
+
+    print("-" * 40)
+    print(f"{total_hits} match(es) across {len(paths)} epub(s)")
 
 
 # -- check ----------------------------------------------------------------------
@@ -106,6 +185,19 @@ def _parse_only(only_args):
             raise SystemExit(f"--only expects SITE:CHAPTER_ID, got {item!r}")
         out.add((site_key, chapter_id))
     return out
+
+
+def _retarget_output(entry, title, end):
+    """The output filename bakes in the title and the last chapter number, so
+    it has to shift as a novel gets new chapters. Compute the current-correct
+    path, drop the stale file if the name changed, and update the entry
+    in place. Returns the path build_epub() should write to."""
+    new_path = epub_path(title, 1, end)
+    old_path = entry.get("output_file")
+    if old_path and old_path != new_path and os.path.exists(old_path):
+        os.remove(old_path)
+    entry["output_file"] = new_path
+    return new_path
 
 
 def _check_one(entry, cache_dir, delay, dry_run):
@@ -156,7 +248,8 @@ def _check_one(entry, cache_dir, delay, dry_run):
             all_chapters, _, _ = scrape_chapters(
                 profile, session, base_url, entry["chapter_id"],
                 range(1, entry["last_known_chapter"] + 1), cache_dir=cache_dir, delay=delay)
-            build_epub(title, profile.site_key, entry["chapter_id"], all_chapters, entry["output_file"])
+            out_path = _retarget_output(entry, title, entry["last_known_chapter"])
+            build_epub(title, profile.site_key, entry["chapter_id"], all_chapters, out_path)
         record_check(entry, title=title)
     else:
         all_chapters, failed_ns, stopped_at = scrape_chapters(
@@ -169,7 +262,8 @@ def _check_one(entry, cache_dir, delay, dry_run):
 
         new_last_known = (stopped_at - 1) if stopped_at else total
         entry["failed_chapters"] = failed_ns
-        build_epub(title, profile.site_key, entry["chapter_id"], all_chapters, entry["output_file"])
+        out_path = _retarget_output(entry, title, new_last_known)
+        build_epub(title, profile.site_key, entry["chapter_id"], all_chapters, out_path)
         record_check(entry, total=new_last_known, title=title,
                      updated=(new_last_known > entry["last_known_chapter"]))
         if stopped_at:
@@ -257,6 +351,25 @@ def build_parser():
     p_check.add_argument("--only", action="append", default=None, metavar="SITE:CHAPTER_ID")
     p_check.add_argument("--dry-run", action="store_true")
     p_check.set_defaults(func=cmd_check)
+
+    p_search = sub.add_parser("search", help="Search tracked novels by title")
+    p_search.add_argument("query")
+    p_search.add_argument("--library", default=DEFAULT_LIBRARY_PATH, metavar="FILE")
+    p_search.set_defaults(func=cmd_search)
+
+    p_find = sub.add_parser("find", help="Search a site for a novel to add")
+    p_find.add_argument("query")
+    p_find.add_argument("--site", choices=sorted(PROFILES), default=None, metavar="KEY")
+    p_find.add_argument("--limit", type=int, default=15, metavar="N")
+    p_find.set_defaults(func=cmd_find)
+
+    p_grep = sub.add_parser("grep", help="Full-text search inside downloaded epub chapters")
+    p_grep.add_argument("query")
+    p_grep.add_argument("--epubs-dir", default=EPUB_DIR, metavar="DIR")
+    p_grep.add_argument("--case-sensitive", action="store_true")
+    p_grep.add_argument("--context", type=int, default=60, metavar="N",
+                         help="Characters of context around each match (default: 60)")
+    p_grep.set_defaults(func=cmd_grep)
 
     return parser
 

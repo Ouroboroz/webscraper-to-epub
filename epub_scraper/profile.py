@@ -14,6 +14,12 @@ class ChapterResult(NamedTuple):
     body_html: str
 
 
+class SearchResult(NamedTuple):
+    title: str
+    url: str
+    chapters: Optional[int]
+
+
 @dataclass(frozen=True)
 class SiteProfile:
     site_key: str
@@ -35,3 +41,16 @@ class SiteProfile:
     # Escape hatch: when set, bypasses the declarative fields above entirely.
     parse_index_fn: Optional[Callable[[str, str], IndexResult]] = None
     parse_chapter_fn: Optional[Callable[[str, int], ChapterResult]] = None
+
+    # -- Site search (optional: None means this site doesn't support `find`) ----
+    search_base_url: Optional[str] = None
+    search_url: Optional[str] = None
+    search_method: str = "get"                 # "get" or "post"
+    search_query_param: Optional[str] = None
+    search_extra_params: dict = field(default_factory=dict)
+    search_result_selector: Optional[str] = None
+    search_link_selector: str = "a[href]"
+    search_chapter_count_pattern: Optional[str] = None
+
+    # Escape hatch for sites whose search doesn't fit the declarative shape above.
+    search_fn: Optional[Callable[[object, str], list]] = None

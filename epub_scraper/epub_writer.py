@@ -1,3 +1,5 @@
+import os
+
 from ebooklib import epub
 
 
@@ -38,4 +40,7 @@ p     { margin: 0 0 0.8em 0; text-indent: 1.5em; }
     book.add_item(epub.EpubNav())
     book.spine = ["nav"] + epub_chapters
 
+    directory = os.path.dirname(output_file)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
     epub.write_epub(output_file, book)

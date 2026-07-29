@@ -24,4 +24,16 @@ PROFILE = SiteProfile(
         "Tap the screen", "Use arrow keys", "keyboard keys",
         "You'll Also Like", "Bookmark this page",
     ],
+    # Search: the site's own search box POSTs to this endpoint with field name
+    # "keyboard" (a typo baked into their markup, not ours), plus three hidden
+    # fields (show/tempid/tbname) the backend requires or it 404s, and returns
+    # a page of <li class="novel-item"> results.
+    search_base_url="https://www.fanmtl.com",
+    search_url="https://www.fanmtl.com/e/search/index.php",
+    search_method="post",
+    search_query_param="keyboard",
+    search_extra_params={"show": "title", "tempid": "1", "tbname": "news"},
+    search_result_selector="li.novel-item",
+    search_link_selector='a[href^="/novel/"]',
+    search_chapter_count_pattern=r"(\d+)\s+Chapters?",
 )
