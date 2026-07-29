@@ -1,6 +1,11 @@
 # Scraped HTML cache (regenerable, large)
 .cache/
 
+# Scheduled-update-check runtime state (mutates every run; not committed config)
+library.json
+.update_check.lock
+logs/
+
 # Generated output
 *.epub
 

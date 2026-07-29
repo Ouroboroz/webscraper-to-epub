@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timezone
 
 
 def slugify(title):
@@ -11,3 +12,7 @@ def slugify(title):
 def get_base_url(url):
     m = re.match(r"(https?://[^/]+)", url)
     return m.group(1) if m else ""
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()

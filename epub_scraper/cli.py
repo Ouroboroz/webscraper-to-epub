@@ -22,14 +22,13 @@ Requirements:
 
 import argparse
 import sys
-import time
 
 import requests
 
 from . import engine
-from .cache import load_cached, save_cache
 from .epub_writer import build_epub
 from .fetcher import HEADERS, fetch
+from .scrape import scrape_chapters
 from .sites import PROFILES, resolve_profile
 from .util import get_base_url, slugify
 
@@ -97,37 +96,19 @@ def main():
     print("-" * 56)
 
     # -- Fetch chapters -------------------------------------------------------
-    chapters = []
-    skipped = 0
+    def _progress(i, count, n, flag, label):
+        if flag == "skip":
+            print(f"  [SKIP] Ch {n:>4d}  {label}")
+        else:
+            pct = int((i + 1) / count * 100)
+            glyph = "·" if flag == "cache" else "↓"
+            print(f"  [{pct:3d}%] {glyph} Ch {n:>4d}  {label[:50]}")
 
-    for i, n in enumerate(chapter_range):
-        url = engine.chapter_url(profile, base_url, chapter_id, n)
-        src = None
-        try:
-            # Try cache first
-            cached = None if args.no_cache else load_cached(args.cache_dir, chapter_id, n)
-            if cached:
-                html = cached
-                src = "cache"
-            else:
-                html = fetch(url, session)
-                save_cache(args.cache_dir, chapter_id, n, html)
-                src = "web"
-
-            ch_title, body = engine.parse_chapter(profile, html, n)
-            chapters.append((ch_title, body))
-            pct = int((i + 1) / len(chapter_range) * 100)
-            flag = "·" if src == "cache" else "↓"
-            print(f"  [{pct:3d}%] {flag} Ch {n:>4d}  {ch_title[:50]}")
-        except requests.HTTPError as e:
-            print(f"  [SKIP] Ch {n:>4d}  HTTP {e.response.status_code}")
-            skipped += 1
-        except Exception as e:
-            print(f"  [SKIP] Ch {n:>4d}  {e}")
-            skipped += 1
-
-        if i < len(chapter_range) - 1 and src == "web":
-            time.sleep(args.delay)
+    chapters, failed_ns, _ = scrape_chapters(
+        profile, session, base_url, chapter_id, chapter_range,
+        cache_dir=args.cache_dir, no_cache=args.no_cache,
+        delay=args.delay, progress_cb=_progress)
+    skipped = len(failed_ns)
 
     print("-" * 56)
 
