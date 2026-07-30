@@ -10,30 +10,42 @@ Usage:
   python -m epub_scraper.update search <query> [--library FILE]
   python -m epub_scraper.update find <query> [--site KEY] [--limit N]
   python -m epub_scraper.update grep <query> [--epubs-dir DIR] [--case-sensitive] [--context N]
+  python -m epub_scraper.update check ... [--email] [--email-threshold N] [--mail-config FILE]
+  python -m epub_scraper.update mail <site_key> <chapter_id> [--library FILE] [--mail-config FILE]
 """
 
 import argparse
 import glob
 import os
 import sys
+import tempfile
 import time
+import uuid
 
 import requests
 
 from . import engine
 from .epub_writer import build_epub
 from .fetcher import HEADERS, fetch
-from .library import (DEFAULT_LIBRARY_PATH, add_novel, load_library, record_check,
-                       remove_novel, save_library)
+from .library import (DEFAULT_LIBRARY_PATH, add_novel, find_novel, load_library,
+                       record_check, record_email, remove_novel, save_library)
+from .mailer import (DEFAULT_MAIL_CONFIG_PATH, MailConfigError, MailSendError,
+                      SanityCheckError, load_mail_config, send_epub_to_kindle,
+                      send_failure_alert)
 from .scrape import scrape_chapters
 from .sites import PROFILES, resolve_profile
 from .textsearch import search_epub_text
-from .util import EPUB_DIR, epub_path, get_base_url
+from .util import EPUB_DIR, epub_filename, epub_path, get_base_url
 
 # Consecutive real chapter-fetch failures that abort a novel's fetch for this run.
 CIRCUIT_BREAKER_THRESHOLD = 3
 # Consecutive checks with zero progress before a novel is auto-disabled.
 AUTO_DISABLE_AFTER = 5
+# Chapters accumulated (since the last successful Kindle send) before a batch
+# fires -- Send-to-Kindle-by-email never merges/replaces, so each send is its
+# own non-overlapping [last_emailed_chapter+1 .. last_known_chapter] slice
+# rather than a resend of the whole growing book.
+EMAIL_CHAPTER_THRESHOLD = 100
 
 
 def _session_for(url):
@@ -200,9 +212,60 @@ def _retarget_output(entry, title, end):
     return new_path
 
 
-def _check_one(entry, cache_dir, delay, dry_run):
+def _send_batch(entry, profile, session, base_url, cache_dir, delay, config,
+                 library, library_path, *, force=False, threshold=EMAIL_CHAPTER_THRESHOLD):
+    """Build and send exactly the chapters not yet emailed
+    (last_emailed_chapter+1 .. last_known_chapter) as their own small epub --
+    never a resend of the whole growing book, since Send-to-Kindle-by-email
+    can't merge/replace an existing document anyway. Those chapters are
+    already cached from the normal check flow in the common case, so this
+    costs no new network calls. force=True (manual `mail`) bypasses the
+    threshold; force=False (semi-automatic `check --email`) only fires once
+    the pending range is at least `threshold` chapters.
+
+    Returns "nothing-new" / "below-threshold" / "sent" / "failed"."""
+    start = entry.get("last_emailed_chapter", 0) + 1
+    end = entry["last_known_chapter"]
+    if end < start:
+        return "nothing-new"
+    if not force and (end - start + 1) < threshold:
+        return "below-threshold"
+
+    batch_chapters, _, _ = scrape_chapters(
+        profile, session, base_url, entry["chapter_id"], range(start, end + 1),
+        cache_dir=cache_dir, delay=delay)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"kindle-batch-{uuid.uuid4().hex}.epub")
+    build_epub(entry["title"], profile.site_key, entry["chapter_id"], batch_chapters, tmp_path)
+    attachment_name = epub_filename(entry["title"], start, end)
+
+    try:
+        send_epub_to_kindle(tmp_path, entry["title"], config, attachment_name=attachment_name)
+    except (SanityCheckError, MailSendError) as e:
+        kind = "refused" if isinstance(e, SanityCheckError) else "send error"
+        print(f"  email failed ({kind}): {e}")
+        record_email(entry, error=str(e))
+        save_library(library, library_path)
+        send_failure_alert(f"[epub_scraper] Kindle send failed: {entry['title']}",
+                            f"Batch Ch {start}-{end} of {entry['title']} failed: {e}", config)
+        return "failed"
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)  # transient -- library.json's last_emailed_* is the record
+
+    record_email(entry, chapter=end)
+    save_library(library, library_path)
+    print(f"  emailed Ch {start}-{end} to Kindle")
+    return "sent"
+
+
+def _check_one(entry, cache_dir, delay, dry_run, library=None, library_path=None,
+                mail_config=None, email_threshold=EMAIL_CHAPTER_THRESHOLD):
     """Check and, if needed, update a single tracked novel in place.
-    Returns a short status string for the summary tally."""
+    Returns a short status string for the summary tally.
+
+    library/library_path are only required when mail_config is given -- they
+    let _send_batch persist its own email bookkeeping immediately, the same
+    way cmd_check's outer loop persists check bookkeeping."""
     profile = PROFILES.get(entry["site_key"])
     if profile is None:
         record_check(entry, error=f"unknown site_key {entry['site_key']!r}")
@@ -270,6 +333,17 @@ def _check_one(entry, cache_dir, delay, dry_run):
             entry["last_error"] = (f"circuit breaker: {CIRCUIT_BREAKER_THRESHOLD} consecutive "
                                     f"failures starting at chapter {stopped_at}")
 
+        # Batch-email gate lives here (delta>0 branch only): start/end are
+        # computed from persistent entry fields, not this run's fetch count,
+        # so any backlog left over from a prior failed/skipped send is
+        # automatically included the next time this branch fires. A run
+        # where the index reports no new chapters at all won't catch a
+        # leftover backlog -- narrow, self-healing the moment new chapters
+        # appear, not worth complicating the retry-only branch for.
+        if mail_config is not None:
+            _send_batch(entry, profile, session, base_url, cache_dir, delay, mail_config,
+                        library, library_path, threshold=email_threshold)
+
     if fetched_count > 0:
         entry["consecutive_failed_checks"] = 0
     else:
@@ -284,6 +358,38 @@ def _check_one(entry, cache_dir, delay, dry_run):
     return "updated" if fetched_count > 0 else "no-progress"
 
 
+def cmd_mail(args):
+    """Email a tracked novel's not-yet-sent chapters to Kindle right now,
+    bypassing the batch threshold (this is an explicit, deliberate request)."""
+    library = load_library(args.library)
+    entry = find_novel(library, args.site_key, args.chapter_id)
+    if entry is None:
+        print(f"Not tracked: {args.site_key}:{args.chapter_id}")
+        sys.exit(1)
+
+    profile = PROFILES.get(entry["site_key"])
+    if profile is None:
+        print(f"Unknown site_key {entry['site_key']!r}")
+        sys.exit(1)
+
+    try:
+        mail_config = load_mail_config(args.mail_config)
+    except MailConfigError as e:
+        print(str(e))
+        sys.exit(1)
+
+    session = _session_for(entry["index_url"])
+    base_url = get_base_url(entry["index_url"])
+
+    status = _send_batch(entry, profile, session, base_url, args.cache_dir, args.delay,
+                          mail_config, library, args.library, force=True)
+
+    if status == "nothing-new":
+        print(f"Nothing new to send since chapter {entry.get('last_emailed_chapter', 0)}.")
+    elif status == "failed":
+        sys.exit(1)
+
+
 def cmd_check(args):
     library = load_library(args.library)
     only = _parse_only(args.only)
@@ -295,11 +401,21 @@ def cmd_check(args):
         print("No matching novels to check." if only else "No enabled tracked novels to check.")
         return
 
+    mail_config = None
+    if args.email:
+        try:
+            mail_config = load_mail_config(args.mail_config)
+        except MailConfigError as e:
+            print(str(e))
+            sys.exit(1)
+
     tally = {}
     for i, entry in enumerate(targets):
         label = f"{entry['site_key']}:{entry['chapter_id']}"
         try:
-            status = _check_one(entry, cache_dir=args.cache_dir, delay=args.delay, dry_run=args.dry_run)
+            status = _check_one(entry, cache_dir=args.cache_dir, delay=args.delay, dry_run=args.dry_run,
+                                 library=library, library_path=args.library,
+                                 mail_config=mail_config, email_threshold=args.email_threshold)
         except (SystemExit, Exception) as e:
             record_check(entry, error=str(e))
             status = "error"
@@ -350,6 +466,12 @@ def build_parser():
     p_check.add_argument("--novel-delay", type=float, default=5.0, metavar="SECS")
     p_check.add_argument("--only", action="append", default=None, metavar="SITE:CHAPTER_ID")
     p_check.add_argument("--dry-run", action="store_true")
+    p_check.add_argument("--email", action="store_true",
+                          help="After checking, email tracked novels to Kindle once "
+                               "--email-threshold new chapters have accumulated since the "
+                               "last send (off by default)")
+    p_check.add_argument("--email-threshold", type=int, default=EMAIL_CHAPTER_THRESHOLD, metavar="N")
+    p_check.add_argument("--mail-config", default=DEFAULT_MAIL_CONFIG_PATH, metavar="FILE")
     p_check.set_defaults(func=cmd_check)
 
     p_search = sub.add_parser("search", help="Search tracked novels by title")
@@ -370,6 +492,16 @@ def build_parser():
     p_grep.add_argument("--context", type=int, default=60, metavar="N",
                          help="Characters of context around each match (default: 60)")
     p_grep.set_defaults(func=cmd_grep)
+
+    p_mail = sub.add_parser("mail", help="Email a tracked novel's not-yet-sent chapters "
+                                          "to Kindle now (bypasses the email threshold)")
+    p_mail.add_argument("site_key")
+    p_mail.add_argument("chapter_id")
+    p_mail.add_argument("--cache-dir", default=".cache", metavar="DIR")
+    p_mail.add_argument("--delay", type=float, default=2.5, metavar="SECS")
+    p_mail.add_argument("--library", default=DEFAULT_LIBRARY_PATH, metavar="FILE")
+    p_mail.add_argument("--mail-config", default=DEFAULT_MAIL_CONFIG_PATH, metavar="FILE")
+    p_mail.set_defaults(func=cmd_mail)
 
     return parser
 

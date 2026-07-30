@@ -63,6 +63,9 @@ def add_novel(library, *, site_key, chapter_id, index_url, title, output_file, l
         "last_checked_at": None,
         "last_updated_at": None,
         "last_error": None,
+        "last_emailed_chapter": 0,
+        "last_emailed_at": None,
+        "last_email_error": None,
         "enabled": True,
     }
     library["novels"].append(entry)
@@ -88,3 +91,13 @@ def record_check(entry, *, total=None, title=None, error=None, updated=False):
     if updated:
         entry["last_known_chapter"] = total
         entry["last_updated_at"] = now_iso()
+
+
+def record_email(entry, *, chapter=None, error=None):
+    """Single bookkeeping call site per novel per Kindle-send attempt: always
+    stamps last_emailed_at and last_email_error; on success (error is None)
+    advances last_emailed_chapter to `chapter`."""
+    entry["last_emailed_at"] = now_iso()
+    entry["last_email_error"] = error
+    if error is None:
+        entry["last_emailed_chapter"] = chapter

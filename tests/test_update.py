@@ -7,6 +7,8 @@ import requests
 
 from epub_scraper import cache, update
 from epub_scraper.library import add_novel, load_library, save_library
+from epub_scraper.mailer import MailConfig, MailConfigError, MailSendError, SanityCheckError
+from epub_scraper.sites import PROFILES
 from conftest import load_fixture
 from fakes import FakeResponse, FakeSession
 from html_builders import fanmtl_chapter_html, fanmtl_index_html, fanmtl_index_html_no_links
@@ -52,6 +54,42 @@ class BuildEpubRecorder:
 
 def use_session(monkeypatch, session):
     monkeypatch.setattr(update, "_session_for", lambda url: session)
+
+
+def mail_config(**overrides):
+    values = dict(smtp_host="smtp.gmail.com", smtp_port=587, smtp_user="u@gmail.com",
+                  smtp_password="pw", from_addr="u@gmail.com", kindle_addr="k@kindle.com",
+                  alert_addr="u@gmail.com", smtp_use_ssl=False)
+    values.update(overrides)
+    return MailConfig(**values)
+
+
+class SendEpubRecorder:
+    """Stands in for update.send_epub_to_kindle. raise_exc, if given, is raised
+    (not returned) after recording the call -- for SanityCheckError/MailSendError
+    failure-path tests."""
+
+    def __init__(self, raise_exc=None):
+        self.calls = []
+        self.raise_exc = raise_exc
+
+    def __call__(self, epub_path, subject, config, attachment_name=None, **kw):
+        self.calls.append((epub_path, subject, config, attachment_name))
+        if self.raise_exc is not None:
+            raise self.raise_exc
+
+
+class SendAlertRecorder:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, subject, message, config, **kw):
+        self.calls.append((subject, message, config))
+        return True
+
+
+def never_called(*a, **kw):
+    raise AssertionError("this must not be called")
 
 
 # ===== _check_one ================================================================
@@ -468,6 +506,424 @@ def test_retarget_output_title_sanitization_reflected_in_path():
     assert new_path == "epubs/[Ch 1 - Ch 1] A - BC.epub"
 
 
+# ===== _send_batch =================================================================
+
+def test_send_batch_nothing_pending_returns_nothing_new(cache_dir, tmp_path):
+    entry = make_entry(last_known_chapter=50, last_emailed_chapter=50)
+    library_path = str(tmp_path / "library.json")
+    session = FakeSession(strict=True)
+
+    status = update._send_batch(entry, PROFILES["fanmtl"], session, BASE_URL, cache_dir, 0,
+                                 mail_config(), {"novels": [entry]}, library_path)
+
+    assert status == "nothing-new"
+    assert session.calls == []
+
+
+def test_send_batch_below_threshold_not_sent(monkeypatch, cache_dir, tmp_path):
+    entry = make_entry(last_known_chapter=50, last_emailed_chapter=0)
+    library_path = str(tmp_path / "library.json")
+    recorder = SendEpubRecorder()
+    monkeypatch.setattr(update, "send_epub_to_kindle", recorder)
+
+    status = update._send_batch(entry, PROFILES["fanmtl"], FakeSession(strict=True), BASE_URL,
+                                 cache_dir, 0, mail_config(), {"novels": [entry]}, library_path,
+                                 threshold=100)
+
+    assert status == "below-threshold"
+    assert recorder.calls == []
+    assert entry["last_emailed_chapter"] == 0
+
+
+def test_send_batch_at_threshold_sends_correct_range(monkeypatch, cache_dir, tmp_path):
+    entry = make_entry(title="My Novel", last_known_chapter=100, last_emailed_chapter=0)
+    library_path = str(tmp_path / "library.json")
+    responses = {chapter_url(n): FakeResponse(chapter_page(n), 200, chapter_url(n))
+                 for n in range(1, 101)}
+    session = FakeSession(responses)  # strict: only 1..100 stubbed
+    recorder = SendEpubRecorder()
+    monkeypatch.setattr(update, "send_epub_to_kindle", recorder)
+
+    status = update._send_batch(entry, PROFILES["fanmtl"], session, BASE_URL, cache_dir, 0,
+                                 mail_config(), {"novels": [entry]}, library_path, threshold=100)
+
+    assert status == "sent"
+    assert len(recorder.calls) == 1
+    tmp_epub_path, subject, config, attachment_name = recorder.calls[0]
+    assert attachment_name == "[Ch 1 - Ch 100] My Novel.epub"
+    assert not os.path.exists(tmp_epub_path)  # cleaned up after send
+    assert entry["last_emailed_chapter"] == 100
+    assert entry["last_emailed_at"] is not None
+
+
+def test_send_batch_force_true_bypasses_threshold(monkeypatch, cache_dir, tmp_path):
+    entry = make_entry(last_known_chapter=5, last_emailed_chapter=0)
+    library_path = str(tmp_path / "library.json")
+    responses = {chapter_url(n): FakeResponse(chapter_page(n), 200, chapter_url(n))
+                 for n in range(1, 6)}
+    session = FakeSession(responses)
+    recorder = SendEpubRecorder()
+    monkeypatch.setattr(update, "send_epub_to_kindle", recorder)
+
+    status = update._send_batch(entry, PROFILES["fanmtl"], session, BASE_URL, cache_dir, 0,
+                                 mail_config(), {"novels": [entry]}, library_path,
+                                 force=True, threshold=100)
+
+    assert status == "sent"
+    assert len(recorder.calls) == 1
+
+
+def test_send_batch_attachment_name_is_batch_range_not_overall_range(monkeypatch, cache_dir, tmp_path):
+    entry = make_entry(title="My Novel", last_known_chapter=150, last_emailed_chapter=100)
+    library_path = str(tmp_path / "library.json")
+    responses = {chapter_url(n): FakeResponse(chapter_page(n), 200, chapter_url(n))
+                 for n in range(101, 151)}  # only the pending range stubbed
+    session = FakeSession(responses)
+    recorder = SendEpubRecorder()
+    monkeypatch.setattr(update, "send_epub_to_kindle", recorder)
+
+    status = update._send_batch(entry, PROFILES["fanmtl"], session, BASE_URL, cache_dir, 0,
+                                 mail_config(), {"novels": [entry]}, library_path, threshold=50)
+
+    assert status == "sent"
+    assert recorder.calls[0][3] == "[Ch 101 - Ch 150] My Novel.epub"
+    assert entry["last_emailed_chapter"] == 150
+
+
+def test_send_batch_sanity_failure_records_error_alerts_and_cleans_up(monkeypatch, cache_dir, tmp_path):
+    entry = make_entry(last_known_chapter=5, last_emailed_chapter=0)
+    library_path = str(tmp_path / "library.json")
+    responses = {chapter_url(n): FakeResponse(chapter_page(n), 200, chapter_url(n))
+                 for n in range(1, 6)}
+    session = FakeSession(responses)
+    send_recorder = SendEpubRecorder(raise_exc=SanityCheckError("only 1 chapter found"))
+    alert_recorder = SendAlertRecorder()
+    monkeypatch.setattr(update, "send_epub_to_kindle", send_recorder)
+    monkeypatch.setattr(update, "send_failure_alert", alert_recorder)
+
+    status = update._send_batch(entry, PROFILES["fanmtl"], session, BASE_URL, cache_dir, 0,
+                                 mail_config(), {"novels": [entry]}, library_path, force=True)
+
+    assert status == "failed"
+    assert entry["last_email_error"] == "only 1 chapter found"
+    assert entry["last_emailed_chapter"] == 0  # untouched on failure
+    assert len(alert_recorder.calls) == 1
+    tmp_epub_path = send_recorder.calls[0][0]
+    assert not os.path.exists(tmp_epub_path)  # still cleaned up despite failure
+
+
+def test_send_batch_mail_send_error_also_records_and_alerts(monkeypatch, cache_dir, tmp_path):
+    entry = make_entry(last_known_chapter=5, last_emailed_chapter=0)
+    library_path = str(tmp_path / "library.json")
+    responses = {chapter_url(n): FakeResponse(chapter_page(n), 200, chapter_url(n))
+                 for n in range(1, 6)}
+    session = FakeSession(responses)
+    monkeypatch.setattr(update, "send_epub_to_kindle",
+                         SendEpubRecorder(raise_exc=MailSendError("smtp down")))
+    alert_recorder = SendAlertRecorder()
+    monkeypatch.setattr(update, "send_failure_alert", alert_recorder)
+
+    status = update._send_batch(entry, PROFILES["fanmtl"], session, BASE_URL, cache_dir, 0,
+                                 mail_config(), {"novels": [entry]}, library_path, force=True)
+
+    assert status == "failed"
+    assert entry["last_email_error"] == "smtp down"
+    assert len(alert_recorder.calls) == 1
+
+
+# ===== cmd_mail =====================================================================
+
+def test_cmd_mail_sends_even_far_below_threshold(monkeypatch, cache_dir, tmp_path):
+    library_path = str(tmp_path / "library.json")
+    lib = {"novels": []}
+    add_novel(lib, site_key="fanmtl", chapter_id=CHAPTER_ID, index_url=INDEX_URL,
+              title="T", output_file="epubs/x.epub", last_known_chapter=5)
+    save_library(lib, library_path)
+
+    responses = {chapter_url(n): FakeResponse(chapter_page(n), 200, chapter_url(n))
+                 for n in range(1, 6)}
+    session = FakeSession(responses)
+    monkeypatch.setattr(update, "_session_for", lambda url: session)
+    monkeypatch.setattr(update, "load_mail_config", lambda path: mail_config())
+    recorder = SendEpubRecorder()
+    monkeypatch.setattr(update, "send_epub_to_kindle", recorder)
+
+    args = argparse.Namespace(site_key="fanmtl", chapter_id=CHAPTER_ID, cache_dir=cache_dir,
+                               delay=0, library=library_path, mail_config="unused")
+    update.cmd_mail(args)
+
+    assert len(recorder.calls) == 1
+    reloaded = load_library(library_path)
+    assert reloaded["novels"][0]["last_emailed_chapter"] == 5
+
+
+def test_cmd_mail_nothing_pending_prints_message_and_does_not_exit(monkeypatch, tmp_path, capsys):
+    library_path = str(tmp_path / "library.json")
+    lib = {"novels": []}
+    add_novel(lib, site_key="fanmtl", chapter_id=CHAPTER_ID, index_url=INDEX_URL,
+              title="T", output_file="epubs/x.epub", last_known_chapter=5)
+    lib["novels"][0]["last_emailed_chapter"] = 5
+    save_library(lib, library_path)
+
+    monkeypatch.setattr(update, "load_mail_config", lambda path: mail_config())
+    monkeypatch.setattr(update, "_session_for", lambda url: FakeSession(strict=True))
+
+    args = argparse.Namespace(site_key="fanmtl", chapter_id=CHAPTER_ID, cache_dir=".cache",
+                               delay=0, library=library_path, mail_config="unused")
+    update.cmd_mail(args)  # must not raise SystemExit
+    assert "Nothing new to send since chapter 5" in capsys.readouterr().out
+
+
+def test_cmd_mail_untracked_entry_exits_1(tmp_path):
+    library_path = str(tmp_path / "library.json")
+    args = argparse.Namespace(site_key="fanmtl", chapter_id="nope", cache_dir=".cache",
+                               delay=0, library=library_path, mail_config="unused")
+    with pytest.raises(SystemExit) as exc_info:
+        update.cmd_mail(args)
+    assert exc_info.value.code == 1
+
+
+def test_cmd_mail_bad_config_exits_1(monkeypatch, tmp_path):
+    library_path = str(tmp_path / "library.json")
+    lib = {"novels": []}
+    add_novel(lib, site_key="fanmtl", chapter_id=CHAPTER_ID, index_url=INDEX_URL,
+              title="T", output_file="epubs/x.epub", last_known_chapter=5)
+    save_library(lib, library_path)
+
+    def _raise(path):
+        raise MailConfigError("missing kindle_addr")
+    monkeypatch.setattr(update, "load_mail_config", _raise)
+
+    args = argparse.Namespace(site_key="fanmtl", chapter_id=CHAPTER_ID, cache_dir=".cache",
+                               delay=0, library=library_path, mail_config="unused")
+    with pytest.raises(SystemExit) as exc_info:
+        update.cmd_mail(args)
+    assert exc_info.value.code == 1
+
+
+def test_cmd_mail_send_batch_failure_exits_1(monkeypatch, tmp_path):
+    library_path = str(tmp_path / "library.json")
+    lib = {"novels": []}
+    add_novel(lib, site_key="fanmtl", chapter_id=CHAPTER_ID, index_url=INDEX_URL,
+              title="T", output_file="epubs/x.epub", last_known_chapter=5)
+    save_library(lib, library_path)
+
+    monkeypatch.setattr(update, "load_mail_config", lambda path: mail_config())
+    monkeypatch.setattr(update, "_session_for", lambda url: FakeSession(strict=True))
+    monkeypatch.setattr(update, "_send_batch", lambda *a, **kw: "failed")
+
+    args = argparse.Namespace(site_key="fanmtl", chapter_id=CHAPTER_ID, cache_dir=".cache",
+                               delay=0, library=library_path, mail_config="unused")
+    with pytest.raises(SystemExit) as exc_info:
+        update.cmd_mail(args)
+    assert exc_info.value.code == 1
+
+
+# ===== cmd_check --email (via _check_one) ==========================================
+
+def test_check_one_email_none_never_sends_even_above_threshold(monkeypatch, cache_dir, tmp_path):
+    responses = {INDEX_URL: FakeResponse(index_page(total=150), 200, INDEX_URL)}
+    responses.update({chapter_url(n): FakeResponse(chapter_page(n), 200, chapter_url(n))
+                       for n in range(1, 151)})
+    session = FakeSession(responses)
+    use_session(monkeypatch, session)
+    monkeypatch.setattr(update, "build_epub", BuildEpubRecorder())
+    monkeypatch.setattr(update, "_send_batch", never_called)
+    entry = make_entry(last_known_chapter=0)
+
+    status = update._check_one(entry, cache_dir, delay=0, dry_run=False,
+                                library={"novels": [entry]}, library_path=str(tmp_path / "l.json"),
+                                mail_config=None)
+    assert status == "updated"
+    assert entry["last_emailed_chapter"] == 0
+
+
+def test_check_one_email_below_threshold_not_sent(monkeypatch, cache_dir, tmp_path):
+    responses = {INDEX_URL: FakeResponse(index_page(total=50), 200, INDEX_URL)}
+    responses.update({chapter_url(n): FakeResponse(chapter_page(n), 200, chapter_url(n))
+                       for n in range(1, 51)})
+    session = FakeSession(responses)
+    use_session(monkeypatch, session)
+    monkeypatch.setattr(update, "build_epub", BuildEpubRecorder())
+    recorder = SendEpubRecorder()
+    monkeypatch.setattr(update, "send_epub_to_kindle", recorder)
+    entry = make_entry(last_known_chapter=0)
+    library_path = str(tmp_path / "l.json")
+
+    update._check_one(entry, cache_dir, delay=0, dry_run=False,
+                       library={"novels": [entry]}, library_path=library_path,
+                       mail_config=mail_config(), email_threshold=100)
+
+    assert recorder.calls == []
+    assert entry["last_emailed_chapter"] == 0
+
+
+def test_check_one_email_crosses_threshold_from_this_runs_new_chapters(monkeypatch, cache_dir, tmp_path):
+    responses = {INDEX_URL: FakeResponse(index_page(total=150), 200, INDEX_URL)}
+    responses.update({chapter_url(n): FakeResponse(chapter_page(n), 200, chapter_url(n))
+                       for n in range(1, 151)})
+    session = FakeSession(responses)
+    use_session(monkeypatch, session)
+    monkeypatch.setattr(update, "build_epub", BuildEpubRecorder())
+    recorder = SendEpubRecorder()
+    monkeypatch.setattr(update, "send_epub_to_kindle", recorder)
+    entry = make_entry(last_known_chapter=0)
+    library_path = str(tmp_path / "l.json")
+
+    update._check_one(entry, cache_dir, delay=0, dry_run=False,
+                       library={"novels": [entry]}, library_path=library_path,
+                       mail_config=mail_config(), email_threshold=100)
+
+    assert len(recorder.calls) == 1
+    assert entry["last_emailed_chapter"] == 150
+
+
+def test_check_one_email_crosses_via_accumulated_prior_progress(monkeypatch, cache_dir, tmp_path):
+    # Pending BEFORE this run is already 90 (last_known=90, last_emailed=0) --
+    # below the 100 threshold. This run's own fetch only adds 15 chapters
+    # (total=105), but 105 - 0 = 105 >= 100, so it should still fire. Proves
+    # the gate reads stored state, not this run's fetched_count.
+    for n in range(1, 91):
+        cache.save_cache(cache_dir, CHAPTER_ID, n, chapter_page(n))
+    responses = {INDEX_URL: FakeResponse(index_page(total=105), 200, INDEX_URL)}
+    responses.update({chapter_url(n): FakeResponse(chapter_page(n), 200, chapter_url(n))
+                       for n in range(91, 106)})
+    session = FakeSession(responses)
+    use_session(monkeypatch, session)
+    monkeypatch.setattr(update, "build_epub", BuildEpubRecorder())
+    recorder = SendEpubRecorder()
+    monkeypatch.setattr(update, "send_epub_to_kindle", recorder)
+    entry = make_entry(last_known_chapter=90, last_emailed_chapter=0)
+    library_path = str(tmp_path / "l.json")
+
+    update._check_one(entry, cache_dir, delay=0, dry_run=False,
+                       library={"novels": [entry]}, library_path=library_path,
+                       mail_config=mail_config(), email_threshold=100)
+
+    assert len(recorder.calls) == 1
+    assert entry["last_emailed_chapter"] == 105
+
+
+def test_check_one_email_retry_only_branch_never_attempts_send(monkeypatch, cache_dir, tmp_path):
+    # delta<=0 (retry-only branch) with a huge pending backlog -- documented
+    # limitation, not a bug: only the delta>0 branch triggers a batch send.
+    session = FakeSession({
+        INDEX_URL: FakeResponse(index_page(total=150), 200, INDEX_URL),
+        chapter_url(3): FakeResponse(chapter_page(3), 200, chapter_url(3)),
+    })
+    use_session(monkeypatch, session)
+    monkeypatch.setattr(update, "build_epub", BuildEpubRecorder())
+    monkeypatch.setattr(update, "_send_batch", never_called)
+    entry = make_entry(last_known_chapter=150, failed_chapters=[3], last_emailed_chapter=0)
+    library_path = str(tmp_path / "l.json")
+
+    status = update._check_one(entry, cache_dir, delay=0, dry_run=False,
+                                library={"novels": [entry]}, library_path=library_path,
+                                mail_config=mail_config(), email_threshold=100)
+
+    assert status == "updated"
+    assert entry["last_emailed_chapter"] == 0  # backlog untouched
+
+
+def test_check_one_email_threshold_override_respected(monkeypatch, cache_dir, tmp_path):
+    responses = {INDEX_URL: FakeResponse(index_page(total=60), 200, INDEX_URL)}
+    responses.update({chapter_url(n): FakeResponse(chapter_page(n), 200, chapter_url(n))
+                       for n in range(1, 61)})
+    session = FakeSession(responses)
+    use_session(monkeypatch, session)
+    monkeypatch.setattr(update, "build_epub", BuildEpubRecorder())
+    recorder = SendEpubRecorder()
+    monkeypatch.setattr(update, "send_epub_to_kindle", recorder)
+    entry = make_entry(last_known_chapter=0)
+    library_path = str(tmp_path / "l.json")
+
+    update._check_one(entry, cache_dir, delay=0, dry_run=False,
+                       library={"novels": [entry]}, library_path=library_path,
+                       mail_config=mail_config(), email_threshold=50)
+
+    assert len(recorder.calls) == 1
+
+
+def test_check_one_email_dry_run_never_reaches_send_batch(monkeypatch, cache_dir):
+    html = index_page(total=150)
+    session = FakeSession({INDEX_URL: FakeResponse(html, 200, INDEX_URL)})
+    use_session(monkeypatch, session)
+    monkeypatch.setattr(update, "_send_batch", never_called)
+    entry = make_entry(last_known_chapter=0)
+
+    status = update._check_one(entry, cache_dir, delay=0, dry_run=True, mail_config=mail_config())
+    assert status == "dry-run"
+
+
+def test_cmd_check_email_one_novel_failure_does_not_abort_loop(monkeypatch, tmp_path, cache_dir, capsys):
+    library_path = str(tmp_path / "library.json")
+    lib = {"novels": []}
+    add_novel(lib, site_key="fanmtl", chapter_id="novel-a", index_url=f"{BASE_URL}/novel/novel-a.html",
+              title="Novel A", output_file="epubs/a.epub")
+    add_novel(lib, site_key="fanmtl", chapter_id="novel-b", index_url=f"{BASE_URL}/novel/novel-b.html",
+              title="Novel B", output_file="epubs/b.epub")
+    save_library(lib, library_path)
+
+    def url_a(n):
+        return f"{BASE_URL}/novel/novel-a_{n}.html"
+
+    def url_b(n):
+        return f"{BASE_URL}/novel/novel-b_{n}.html"
+
+    responses = {
+        f"{BASE_URL}/novel/novel-a.html": FakeResponse(
+            fanmtl_index_html(chapter_id="novel-a", total=150, title="Novel A"), 200, ""),
+        f"{BASE_URL}/novel/novel-b.html": FakeResponse(
+            fanmtl_index_html(chapter_id="novel-b", total=150, title="Novel B"), 200, ""),
+    }
+    for n in range(1, 151):
+        responses[url_a(n)] = FakeResponse(chapter_page(n), 200, url_a(n))
+        responses[url_b(n)] = FakeResponse(chapter_page(n), 200, url_b(n))
+    session = FakeSession(responses)
+    monkeypatch.setattr(update, "_session_for", lambda url: session)
+    monkeypatch.setattr(update, "load_mail_config", lambda path: mail_config())
+
+    def flaky_send(epub_path, subject, config, attachment_name=None, **kw):
+        if subject == "Novel A":
+            raise MailSendError("boom for A")
+        # Novel B succeeds silently (default real behavior not needed here)
+
+    monkeypatch.setattr(update, "send_epub_to_kindle", flaky_send)
+    monkeypatch.setattr(update, "send_failure_alert", lambda *a, **kw: True)
+
+    args = argparse.Namespace(library=library_path, cache_dir=cache_dir, delay=0,
+                               novel_delay=0, only=None, dry_run=False,
+                               email=True, email_threshold=100, mail_config="unused")
+    update.cmd_check(args)
+
+    out = capsys.readouterr().out
+    assert "updated=2" in out or ("Novel A" in out and "Novel B" in out)
+    reloaded = load_library(library_path)
+    by_title = {e["title"]: e for e in reloaded["novels"]}
+    assert by_title["Novel A"]["last_email_error"] == "boom for A"
+    assert by_title["Novel B"]["last_emailed_chapter"] == 150
+
+
+def test_cmd_check_missing_mail_config_exits_1_before_any_target_checked(monkeypatch, tmp_path):
+    library_path = str(tmp_path / "library.json")
+    lib = {"novels": []}
+    add_novel(lib, site_key="fanmtl", chapter_id=CHAPTER_ID, index_url=INDEX_URL,
+              title="T", output_file="epubs/x.epub")
+    save_library(lib, library_path)
+
+    def _raise(path):
+        raise MailConfigError("missing kindle_addr")
+    monkeypatch.setattr(update, "load_mail_config", _raise)
+    monkeypatch.setattr(update, "_check_one", never_called)
+
+    args = argparse.Namespace(library=library_path, cache_dir=".cache", delay=0,
+                               novel_delay=0, only=None, dry_run=False,
+                               email=True, email_threshold=100, mail_config="unused")
+    with pytest.raises(SystemExit) as exc_info:
+        update.cmd_check(args)
+    assert exc_info.value.code == 1
+
+
 # ===== _parse_only ================================================================
 
 def test_parse_only_none_or_empty_returns_none():
@@ -707,3 +1163,32 @@ def test_build_parser_add_requires_url():
 def test_build_parser_only_repeatable():
     args = update.build_parser().parse_args(["check", "--only", "a:b", "--only", "c:d"])
     assert args.only == ["a:b", "c:d"]
+
+
+def test_build_parser_check_email_defaults():
+    args = update.build_parser().parse_args(["check"])
+    assert args.email is False
+    assert args.email_threshold == 100
+
+
+def test_build_parser_check_email_flag_and_threshold_parse():
+    args = update.build_parser().parse_args(["check", "--email", "--email-threshold", "50"])
+    assert args.email is True
+    assert args.email_threshold == 50
+
+
+def test_build_parser_mail_requires_both_positionals():
+    with pytest.raises(SystemExit):
+        update.build_parser().parse_args(["mail"])
+    with pytest.raises(SystemExit):
+        update.build_parser().parse_args(["mail", "fanmtl"])
+
+
+def test_build_parser_mail_option_defaults():
+    args = update.build_parser().parse_args(["mail", "fanmtl", "abc"])
+    assert args.site_key == "fanmtl"
+    assert args.chapter_id == "abc"
+    assert args.cache_dir == ".cache"
+    assert args.delay == 2.5
+    assert args.library == update.DEFAULT_LIBRARY_PATH
+    assert args.mail_config == update.DEFAULT_MAIL_CONFIG_PATH

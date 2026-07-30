@@ -6,6 +6,9 @@ library.json
 .update_check.lock
 logs/
 
+# Kindle-mail credentials (local-only, never committed)
+.env
+
 # Generated output
 *.epub
 

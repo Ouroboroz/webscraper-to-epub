@@ -59,3 +59,23 @@ class FakeSession:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+class FakeSMTP:
+    """smtplib.SMTP/SMTP_SSL test double. A test's smtp_factory is typically
+    `lambda config: fake` (closing over one instance so the test can inspect
+    fake.sent afterward), or a factory that itself raises to simulate a
+    connect/login failure."""
+
+    def __init__(self, fail_on_sendmail=None):
+        self.sent = []  # [(from_addr, to_addrs, msg_bytes), ...]
+        self.quit_called = False
+        self.fail_on_sendmail = fail_on_sendmail  # Exception instance, or None
+
+    def sendmail(self, from_addr, to_addrs, msg):
+        if self.fail_on_sendmail is not None:
+            raise self.fail_on_sendmail
+        self.sent.append((from_addr, to_addrs, msg))
+
+    def quit(self):
+        self.quit_called = True

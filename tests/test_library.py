@@ -3,7 +3,7 @@ import os
 import pytest
 
 from epub_scraper.library import (add_novel, find_novel, load_library,
-                                   record_check, remove_novel, save_library)
+                                   record_check, record_email, remove_novel, save_library)
 
 
 def test_load_library_missing_file_returns_fresh_structure_without_creating_file(library_path):
@@ -62,6 +62,9 @@ def test_add_novel_appends_with_correct_defaults():
     assert entry["enabled"] is True
     assert entry["last_checked_at"] is None
     assert entry["last_error"] is None
+    assert entry["last_emailed_chapter"] == 0
+    assert entry["last_emailed_at"] is None
+    assert entry["last_email_error"] is None
     assert lib["novels"] == [entry]
 
 
@@ -118,3 +121,19 @@ def test_record_check_updated_false_leaves_last_known_chapter_untouched():
     record_check(entry, updated=False)
     assert entry["last_known_chapter"] == 1
     assert entry["last_updated_at"] is None
+
+
+def test_record_email_error_stamps_last_emailed_at_and_error_leaves_chapter_untouched():
+    entry = {"last_emailed_chapter": 5, "last_emailed_at": None, "last_email_error": None}
+    record_email(entry, error="smtp boom")
+    assert entry["last_emailed_at"] is not None
+    assert entry["last_email_error"] == "smtp boom"
+    assert entry["last_emailed_chapter"] == 5  # untouched on error
+
+
+def test_record_email_success_sets_last_emailed_chapter():
+    entry = {"last_emailed_chapter": 5, "last_emailed_at": None, "last_email_error": "old error"}
+    record_email(entry, chapter=200)
+    assert entry["last_emailed_chapter"] == 200
+    assert entry["last_email_error"] is None
+    assert entry["last_emailed_at"] is not None
