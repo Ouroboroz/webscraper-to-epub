@@ -82,6 +82,21 @@ the filename (and thus what shows up on a Kindle/e-reader) shifts
 automatically as new chapters are fetched — the old filename is removed when
 the new one is written.
 
+## Tests
+
+```
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+All 160 tests run offline — no real site is ever hit. Network calls are
+mocked at the `requests.Session` boundary (`tests/fakes.py`'s `FakeSession`),
+which every fetch/scrape/search call already threads through as a parameter,
+so failure modes (HTTP errors, connection errors, circuit-breaker trips) can
+be injected precisely without touching a real server. Parser tests run
+against real captured HTML in `tests/fixtures/` rather than hand-authored
+stand-ins.
+
 ## Adding a new site
 
 Use the `onboard-site` skill (or see `epub_scraper/sites/fanmtl.py` for a
@@ -107,6 +122,11 @@ epub_scraper/
   tools/          standalone helpers (e.g. fetch_sample.py) for site onboarding
 scripts/
   check_updates.sh   cron-friendly wrapper around `update check` (lockfile + logging)
+tests/
+  fakes.py          FakeSession/FakeResponse requests.Session test double
+  html_builders.py  synthetic HTML generators for parametrized edge cases
+  fixtures/         real captured HTML used as parser test fixtures
+  test_*.py         one file per epub_scraper module
 epubs/            built EPUBs (gitignored)
 .cache/           raw scraped chapter HTML (gitignored)
 library.json      tracked-novel state (gitignored)

@@ -17,6 +17,12 @@ def search_epub_text(path, query, ignore_case=True, context=60):
 
     hits = []
     for item in book.get_items_of_type(ITEM_DOCUMENT):
+        # get_items_of_type(ITEM_DOCUMENT) also yields ebooklib's own nav.xhtml
+        # (the TOC document) alongside our chap_NNNN.xhtml chapters -- skip it,
+        # or a query matching any chapter title spuriously "matches" the TOC too.
+        if not item.get_name().startswith("chap_"):
+            continue
+
         soup = BeautifulSoup(item.get_content(), "html.parser")
         title_tag = soup.find("h1") or soup.find("title")
         chapter_title = title_tag.get_text(strip=True) if title_tag else item.get_name()
