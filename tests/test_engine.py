@@ -136,6 +136,40 @@ def test_parse_index_fn_escape_hatch():
     assert result == IndexResult("T", "id", 3, "https://x")
 
 
+def test_parse_index_skips_nofollow_hidden_decoy_for_chapter_id():
+    html = ('<html><body><h1>Test Novel</h1>'
+            '<a href="/novel/decoy_999.html" rel="nofollow" style="display:none">Ch 999</a>'
+            '<a href="/novel/abc_1.html">Chapter 1</a>'
+            '</body></html>')
+    result = engine.parse_index(PROFILE, html, "https://www.fanmtl.com/novel/abc.html")
+    assert result.chapter_id == "abc"
+
+
+def test_parse_index_skips_aria_hidden_decoy_for_chapter_id():
+    html = ('<html><body><h1>Test Novel</h1>'
+            '<a href="/novel/decoy_999.html" aria-hidden="true">Ch 999</a>'
+            '<a href="/novel/abc_1.html">Chapter 1</a>'
+            '</body></html>')
+    result = engine.parse_index(PROFILE, html, "https://www.fanmtl.com/novel/abc.html")
+    assert result.chapter_id == "abc"
+
+
+def test_parse_index_skips_decoy_link_in_fallback_max_scan():
+    html = ('<html><body><h1>Test Novel</h1>'
+            '<a href="/novel/abc_1.html">Chapter 1</a>'
+            '<a href="/novel/abc_999.html" rel="nofollow">Decoy</a>'
+            '</body></html>')
+    result = engine.parse_index(PROFILE, html, "https://www.fanmtl.com/novel/abc.html")
+    assert result.total == 1
+
+
+def test_parse_index_normal_links_without_decoys_are_unaffected():
+    html = fanmtl_index_html(chapter_id="abc", total=5, with_count_text=False)
+    result = engine.parse_index(PROFILE, html, "https://www.fanmtl.com/novel/abc.html")
+    assert result.chapter_id == "abc"
+    assert result.total == 5
+
+
 def test_chapter_url_formats_template():
     url = engine.chapter_url(PROFILE, "https://www.fanmtl.com", "abc", 7)
     assert url == "https://www.fanmtl.com/novel/abc_7.html"
