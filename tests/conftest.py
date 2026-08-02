@@ -30,6 +30,11 @@ def library_path(tmp_path):
 
 
 @pytest.fixture
+def db_path(tmp_path):
+    return str(tmp_path / "dataspine.db")
+
+
+@pytest.fixture
 def epubs_dir(tmp_path):
     d = tmp_path / "epubs"
     d.mkdir()

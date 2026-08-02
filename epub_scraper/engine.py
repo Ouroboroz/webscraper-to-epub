@@ -61,6 +61,14 @@ def parse_index(profile, html, url):
     return IndexResult(title, chapter_id, total, base_url)
 
 
+def parse_metadata(profile, html):
+    """Return a MetadataResult for a novel's full metadata. Raises
+    NotImplementedError if the site profile hasn't declared metadata support."""
+    if profile.parse_metadata_fn is None:
+        raise NotImplementedError(f"Site '{profile.site_key}' does not support metadata parsing.")
+    return profile.parse_metadata_fn(html)
+
+
 def chapter_url(profile, base_url, chapter_id, n):
     return profile.chapter_url_template.format(base_url=base_url, chapter_id=chapter_id, n=n)
 

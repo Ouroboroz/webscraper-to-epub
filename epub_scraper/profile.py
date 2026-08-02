@@ -20,6 +20,26 @@ class SearchResult(NamedTuple):
     chapters: Optional[int]
 
 
+class CatalogEntry(NamedTuple):
+    """One card from a site's catalog/browse listing page."""
+    title: str
+    url: str
+    chapter_id: Optional[str]
+    chapters: Optional[int]
+    status: Optional[str]
+    updated_text: Optional[str]
+
+
+class MetadataResult(NamedTuple):
+    """A novel's full metadata, beyond what parse_index() captures."""
+    synopsis: Optional[str]
+    genres: list
+    author: Optional[str]
+    alt_title: Optional[str]
+    status: Optional[str]
+    rating: Optional[str]
+
+
 @dataclass(frozen=True)
 class SiteProfile:
     site_key: str
@@ -41,6 +61,7 @@ class SiteProfile:
     # Escape hatch: when set, bypasses the declarative fields above entirely.
     parse_index_fn: Optional[Callable[[str, str], IndexResult]] = None
     parse_chapter_fn: Optional[Callable[[str, int], ChapterResult]] = None
+    parse_metadata_fn: Optional[Callable[[str], MetadataResult]] = None
 
     # -- Site search (optional: None means this site doesn't support `find`) ----
     search_base_url: Optional[str] = None

@@ -6,6 +6,9 @@ library.json
 .update_check.lock
 logs/
 
+# Classification data spine (Stage 0) runtime DB -- mutates every crawl run
+dataspine.db
+
 # Kindle-mail credentials (local-only, never committed)
 .env
 
