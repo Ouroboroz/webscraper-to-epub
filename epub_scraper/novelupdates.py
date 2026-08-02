@@ -2,14 +2,16 @@
 epub_scraper.novelupdates — Novel Updates (NU) enrichment: search by title,
 fetch a series page's associated names/tags/author/status.
 
-NU sits behind a live Cloudflare Managed Challenge (confirmed live during
-planning -- cloudscraper does not clear it). Selectors below are grounded in
-two independently-maintained open-source NU scrapers' real source
-(jckli/novelupdates.py, GetRektByMe/Raitonoberu), not a page this module's
-author could actually fetch and inspect -- confidence noted per field in the
-Classification Data Spine vault story. Treat mismatches as "the live site
-doesn't match those scrapers anymore," not as a logic bug here, until proven
-otherwise by running `python -m epub_scraper.novelupdates check` for real.
+NU sits behind a live Cloudflare Managed Challenge. Series-page selectors
+were originally grounded only in two independent open-source NU scrapers'
+source (jckli/novelupdates.py, GetRektByMe/Raitonoberu) since NU couldn't be
+reached from the environment that first wrote this module -- confirmed
+working (2026-08-02, real-hardware testing) and several were corrected
+against an actual captured page since the reference scrapers turned out to
+be wrong or outdated on some fields (translation_status, release_frequency,
+rating/votes -- see fetch_series()'s docstring). search()'s endpoint is
+confirmed broken and still needs a fix (see its docstring) -- the site's
+real search is JS-driven, not the simple GET the reference scraper used.
 
 `seleniumbase` and `curl_cffi` are NOT base dependencies (see
 requirements-novelupdates.txt) -- most users of this package (FanMTL scraping
@@ -29,6 +31,7 @@ fetch_series() below don't need to know which one they were handed.
 """
 
 import argparse
+import re
 import time
 from typing import NamedTuple, Optional
 from urllib.parse import urljoin
@@ -88,26 +91,37 @@ def _dump_debug(sb):
     gitignored, not meant to be committed."""
     try:
         with open("nu_challenge_debug.html", "w", encoding="utf-8") as f:
-            f.write(sb.driver.page_source)
+            f.write(sb.cdp.get_page_source())
     except Exception as e:
         print(f"  (failed to write nu_challenge_debug.html: {e})")
     try:
-        sb.driver.save_screenshot("nu_challenge_debug.png")
+        sb.cdp.save_screenshot("nu_challenge_debug.png")
     except Exception as e:
         print(f"  (failed to write nu_challenge_debug.png: {e})")
     print("  wrote nu_challenge_debug.html / nu_challenge_debug.png for inspection")
 
 
-def solve_challenge_session(url=BASE_URL, max_solve_attempts=6, poll_delay=2.5):
-    """Solve NU's Cloudflare challenge once with a real (SeleniumBase UC Mode)
+def solve_challenge_session(url=BASE_URL, max_solve_attempts=4, poll_delay=2.0):
+    """Solve NU's Cloudflare challenge once with a real (SeleniumBase CDP Mode)
     browser, then hand back a curl_cffi session (Chrome TLS fingerprint --
     see module docstring for why plain requests doesn't work here) carrying
     its cookies. Cloudflare ties the solved challenge to the session/IP, so
     this is meant to be called once and reused for many search()/
-    fetch_series() calls, not per-lookup. UC Mode is explicitly detectable in
-    headless mode per its own docs -- xvfb=True (a virtual display) is used
-    instead on Linux, so the caller's machine needs Xvfb installed (see
-    requirements-novelupdates.txt)."""
+    fetch_series() calls, not per-lookup.
+
+    **2026-08-02 finding, superseding earlier attempts in this function's
+    history**: SeleniumBase's PyAutoGUI-based click (`uc_gui_click_captcha` /
+    `uc_gui_handle_captcha`) never actually clicks the Turnstile checkbox in
+    this environment -- confirmed by direct testing that PyAutoGUI's setup
+    (`get_configured_pyautogui`) crashes on every call with a `TypeError:
+    'type' object does not support item assignment`, a known unresolved
+    python-xlib 0.33 bug in its RandR extension init (asweigart/pyautogui#202)
+    that's specific to this Xvfb/X-server's RandR opcode -- silently swallowed
+    somewhere upstream, which is why it just never clicked with no visible
+    error. **CDP Mode sidesteps this entirely**: `activate_cdp_mode()` +
+    `click_captcha()` simulate the click through Chrome's DevTools Protocol
+    directly, no PyAutoGUI/Xlib involved -- confirmed working end-to-end by
+    direct testing (solves in ~10s, real series-page HTML afterward)."""
     from curl_cffi import requests as cf_requests  # local import -- see module docstring
     from seleniumbase import SB  # local import -- see module docstring
 
@@ -123,23 +137,20 @@ def solve_challenge_session(url=BASE_URL, max_solve_attempts=6, poll_delay=2.5):
     user_agent = None
 
     last_html = None
-    with SB(uc=True, test=True, xvfb=True) as sb:
-        sb.uc_open_with_reconnect(url, reconnect_time=4)
-        sb.uc_gui_handle_captcha()
+    with SB(uc=True, test=True) as sb:
+        sb.activate_cdp_mode(url)
 
-        # uc_gui_handle_captcha() can return slightly before the resulting
-        # navigation/cookie-set actually lands -- poll page_source rather
-        # than trusting it's done after a single call.
         for _ in range(max_solve_attempts):
-            last_html = sb.driver.page_source
+            last_html = sb.cdp.get_page_source()
             if not looks_like_challenge_page(last_html):
                 solved = True
                 break
+            sb.click_captcha()
             time.sleep(poll_delay)
 
         if solved:
-            cookies = sb.driver.get_cookies()
-            user_agent = sb.driver.execute_script("return navigator.userAgent")
+            cookies = sb.cdp.get_all_cookies()
+            user_agent = sb.cdp.evaluate("navigator.userAgent")
         else:
             reason = _challenge_page_reason(last_html) if last_html else "no page loaded"
             print(f"  still blocked after {max_solve_attempts} checks ({reason})")
@@ -153,14 +164,34 @@ def solve_challenge_session(url=BASE_URL, max_solve_attempts=6, poll_delay=2.5):
     session = cf_requests.Session(impersonate="chrome124")
     session.headers["User-Agent"] = user_agent
     for cookie in cookies:
-        session.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain"))
+        # CDP Mode's get_all_cookies() returns Cookie objects (.name/.value/
+        # .domain attributes), not the dicts driver.get_cookies() used to.
+        session.cookies.set(cookie.name, cookie.value, domain=cookie.domain)
     return session
 
 
 def search(session, query, limit=10):
-    """Query NU's own search (WordPress's native `?s=` query, scoped to its
-    'seriesplan' post type -- no separate AJAX endpoint needed). Returns up
-    to `limit` hits; each still needs fetch_series() for associated names."""
+    """Query NU's own search. Returns up to `limit` hits; each still needs
+    fetch_series() for associated names.
+
+    **CONFIRMED BROKEN as of 2026-08-02, not yet fixed**: the reference
+    scraper's approach (GET / with params s=<query>, post_type=seriesplan)
+    now 404s -- NU's real search form uses post_type=**seriesplans** (plural).
+    Fixing just that typo isn't enough either: a direct GET to that corrected
+    URL gets a *different* Cloudflare block ("Attention Required!", a WAF
+    rule, not the Managed Challenge this module solves for) even from a real
+    solved browser session -- confirmed by testing both a curl_cffi replay
+    AND direct browser navigation to that exact URL. The real search is
+    JS-driven (an autocomplete widget, `delayedSearch()`/`keyenter_search()`
+    handlers on `input[name="s"]`) -- typing into that input via CDP got 90
+    real `/series/` links into the DOM, but not ones matching the typed
+    query, so simulating the interaction isn't right either yet. This needs
+    its own follow-up (most likely: capture the actual AJAX request the
+    autocomplete fires via CDP network logging, rather than another guess).
+    Left in place below since the result-parsing logic itself (once pointed
+    at correct result HTML) is still probably fine -- untested against real
+    result markup either way. `raise_for_status()` means calling this today
+    fails loudly (404/403) rather than silently returning wrong data."""
     url = f"{BASE_URL}/"
     r = session.get(url, params={"s": query, "post_type": "seriesplan"}, timeout=20)
     r.raise_for_status()
@@ -191,27 +222,55 @@ def _links_text(soup, selector):
     return [a.get_text(strip=True) for a in soup.select(selector) if a.get_text(strip=True)]
 
 
-def _header_value(soup, label):
-    """Best-effort lookup for the release-frequency/rating/votes sidebar
-    fields: find an h5.seriesother whose text matches `label` and return its
-    next sibling's text, rather than a fixed positional index (fragile --
-    breaks if NU adds/removes a sidebar section) -- still unverified against
-    a real page, see module docstring."""
+def _release_frequency(soup):
+    """Release Frequency's value is unusual among the seriesother sidebar
+    fields: a bare text node directly after its <h5>, not wrapped in any
+    element -- find_next_sibling() (tag-only) skips right past it to the
+    *next* <h5> instead, silently grabbing the wrong field. Confirmed against
+    a real captured page (2026-08-02) -- <h5 ...>Release Frequency</h5>Every
+    13.1 Day(s)."""
     for h5 in soup.select("h5.seriesother"):
-        if label.lower() in h5.get_text(strip=True).lower():
-            sibling = h5.find_next_sibling()
-            if sibling is not None:
-                return sibling.get_text(strip=True) or None
+        if "release frequency" in h5.get_text(strip=True).lower():
+            sibling = h5.next_sibling
+            if sibling and str(sibling).strip():
+                return str(sibling).strip()
     return None
 
 
+_RATING_VOTES_PATTERN = re.compile(r"\(([\d.]+)\s*/\s*5\.0,\s*([\d,]+)\s*votes?\)", re.I)
+
+
+def _rating_and_votes(soup):
+    """Rating + vote count live together inside the Rating <h5>'s own nested
+    span.uvotes (e.g. "Rating<span class="uvotes">(4.3 / 5.0, 1700 votes)
+    </span>"), not in a sibling table -- confirmed against a real captured
+    page (2026-08-02); table#myrates is the per-star vote breakdown, a
+    different (and uglier to parse) thing entirely."""
+    for h5 in soup.select("h5.seriesother"):
+        if h5.get_text(strip=True).lower().startswith("rating"):
+            uvotes = h5.select_one("span.uvotes")
+            if uvotes is not None:
+                m = _RATING_VOTES_PATTERN.search(uvotes.get_text(strip=True))
+                if m:
+                    return m.group(1), m.group(2)
+    return None, None
+
+
 def fetch_series(session, url):
-    """Fetch and parse one NU series page. High-confidence fields (agreed by
-    both reference scrapers): title, associated_names, genres, tags,
-    translation_status. Medium/low-confidence: author (tries two known
-    selector variants), translation_groups, release_frequency/rating/votes
-    (positional in both reference scrapers -- looked up by header text here
-    instead, see _header_value)."""
+    """Fetch and parse one NU series page.
+
+    Confirmed against a real captured page (2026-08-02): title,
+    associated_names, genres, tags, author, translation_status,
+    release_frequency, rating, votes. Still unverified: translation_groups
+    (the one real page checked -- Reverend Insanity -- is an officially
+    licensed release with no fan-translation groups to test against;
+    selector kept as the reference scraper had it, low confidence).
+
+    translation_status reads div#editstatus ("Status in Country of Origin"
+    -- e.g. "2334 Chapters (Cancelled/Banned)"), not div#showtranslated
+    (which is actually a "Completely Translated" Yes/No flag, a different,
+    less useful field both reference scrapers happened to expose under a
+    similarly-named selector)."""
     r = session.get(url, timeout=20)
     r.raise_for_status()
     if looks_like_challenge_page(r.text):
@@ -233,7 +292,7 @@ def fetch_series(session, url):
     if authors:
         author = ", ".join(authors)
 
-    status_tag = soup.select_one("div#showtranslated")
+    status_tag = soup.select_one("div#editstatus")
     translation_status = status_tag.get_text(strip=True) if status_tag else None
 
     translation_groups = [
@@ -242,13 +301,15 @@ def fetch_series(session, url):
         if span.get_text(strip=True)
     ]
 
+    rating, votes = _rating_and_votes(soup)
+
     return NUSeriesMetadata(
         url=url, title=title, associated_names=associated_names, genres=genres, tags=tags,
         author=author, translation_status=translation_status,
         translation_groups=translation_groups,
-        release_frequency=_header_value(soup, "Release Frequency"),
-        rating=_header_value(soup, "Rating"),
-        votes=_header_value(soup, "Vote"),
+        release_frequency=_release_frequency(soup),
+        rating=rating,
+        votes=votes,
     )
 
 

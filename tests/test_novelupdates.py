@@ -79,16 +79,16 @@ def test_fetch_series_parses_high_confidence_fields():
 def test_fetch_series_parses_medium_confidence_fields():
     url = "https://www.novelupdates.com/series/x/"
     html = nu_series_html(translation_groups=["Group One", "Group Two"],
-                           release_frequency="3.5 Chapters Per Week",
-                           rating="4.5 / 5", votes="1200")
+                           release_frequency="Every 13.1 Day(s)",
+                           rating="4.3", votes="1700")
     session = FakeSession({url: FakeResponse(html, 200, url)})
 
     result = fetch_series(session, url)
 
     assert result.translation_groups == ["Group One", "Group Two"]
-    assert result.release_frequency == "3.5 Chapters Per Week"
-    assert result.rating == "4.5 / 5"
-    assert result.votes == "1200"
+    assert result.release_frequency == "Every 13.1 Day(s)"
+    assert result.rating == "4.3"
+    assert result.votes == "1700"
 
 
 def test_fetch_series_missing_optional_fields_are_none_or_empty():
@@ -101,6 +101,25 @@ def test_fetch_series_missing_optional_fields_are_none_or_empty():
     assert result.associated_names == []
     assert result.author is None
     assert result.release_frequency is None
+
+
+def test_fetch_series_real_fixture_reverend_insanity():
+    # Captured 2026-08-02 via a real solved session (see solve_challenge_session's
+    # docstring) -- the only real (non-synthetic) NU series page fixture here.
+    url = "https://www.novelupdates.com/series/reverend-insanity/"
+    html = load_fixture("novelupdates_series_reverend_insanity.html")
+    session = FakeSession({url: FakeResponse(html, 200, url)})
+
+    result = fetch_series(session, url)
+
+    assert result.title == "Reverend Insanity"
+    assert "Gu Zhen Ren" in result.author
+    assert "Action" in result.genres
+    assert "Cultivation" in result.tags
+    assert result.translation_status == "2334 Chapters (Cancelled/Banned)"
+    assert result.release_frequency == "Every 13.1 Day(s)"
+    assert result.rating == "4.3"
+    assert result.votes == "1700"
 
 
 def test_fetch_series_raises_challenge_expired_when_blocked():

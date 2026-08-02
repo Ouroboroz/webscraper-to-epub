@@ -13,6 +13,9 @@ dataspine.db
 nu_challenge_debug.html
 nu_challenge_debug.png
 
+# SeleniumBase's own runtime lock files (PyAutoGUI/driver-download locks)
+downloaded_files/
+
 # Kindle-mail credentials (local-only, never committed)
 .env
 
