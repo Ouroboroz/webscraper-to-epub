@@ -23,7 +23,8 @@ python -m epub_scraper <novel-index-url> [options]
 |---|---|---|
 | `--start N` | `1` | First chapter to fetch |
 | `--end N` | auto-detect | Last chapter to fetch (inclusive) |
-| `--delay SECS` | `2.5` | Delay between chapter requests |
+| `--delay SECS` | `2.5` | Mean delay between chapter requests (actual gap is jittered around this) |
+| `--pacing-file FILE` | `pacing.json` | Where to persist learned per-site request pacing |
 | `--output FILE` | auto | Output path (default: `epubs/[Ch start - Ch end] Title.epub`) |
 | `--cache-dir DIR` | `.cache` | Where raw chapter HTML is cached |
 | `--no-cache` | off | Ignore and overwrite any existing cache |
@@ -68,6 +69,30 @@ fetch on one run gets silently retried on the next. Three consecutive
 real-fetch failures for a novel trip a circuit breaker and stop that novel's
 run early (so one dead chapter doesn't burn through a rate-limited fetch loop
 for nothing); five consecutive checks with zero progress auto-disable it.
+
+### Request pacing & resilience
+
+Every fetch goes through a few cheap defenses adapted from reviewing
+[lncrawl/scraper](https://github.com/lncrawl/scraper) (Apache-2.0):
+
+- **Jittered pacing.** `--delay` is the *mean* of a randomized gap between
+  chapter requests, not a fixed sleep — perfectly regular request timing is
+  itself a signal that whatever's making the requests isn't a person.
+- **Learned backoff.** A `429` (or a server's own `Retry-After` header, when
+  present) widens the delay for that site and persists it to `pacing.json`
+  (`--pacing-file` to override the path) so the next run — including the
+  next `check` under cron — starts already slowed down instead of relearning
+  the same limit from scratch. The interval only ever widens, never shrinks
+  back down automatically.
+- **Challenge-page detection.** A `200` response whose body looks like a
+  bot-challenge/interstitial page (rather than real chapter content) is
+  treated as a failure and triggers the same backoff as a `429`, instead of
+  silently being cached and shipped into the EPUB as garbage.
+- **Honeypot-link filtering.** When scanning a novel's index page for its
+  chapter ID, links that are `rel=nofollow`, `hidden`, `aria-hidden="true"`,
+  or hidden via inline `display:none`/`visibility:hidden`/`opacity:0` are
+  ignored — a defense against decoy links some sites plant specifically to
+  catch scrapers walking every `<a href>` on the page.
 
 ### Auto-email to Kindle
 
@@ -206,6 +231,7 @@ tests/
 epubs/            built EPUBs (gitignored)
 .cache/           raw scraped chapter HTML (gitignored)
 library.json      tracked-novel state (gitignored)
+pacing.json       learned per-site request pacing (gitignored)
 .env.example      template for .env -- copy and fill in (committed)
 .env              Kindle-mail credentials (gitignored)
 ```

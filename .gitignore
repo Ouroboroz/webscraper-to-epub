@@ -3,6 +3,7 @@
 
 # Scheduled-update-check runtime state (mutates every run; not committed config)
 library.json
+pacing.json
 .update_check.lock
 logs/
 
