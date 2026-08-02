@@ -1,7 +1,8 @@
 import pytest
 
 from epub_scraper import engine
-from epub_scraper.profile import ChapterResult, IndexResult, SearchResult, SiteProfile
+from epub_scraper.profile import (ChapterResult, IndexResult, MetadataResult,
+                                   SearchResult, SiteProfile)
 from epub_scraper.sites.fanmtl import PROFILE
 from conftest import load_fixture
 from fakes import FakeResponse, FakeSession
@@ -134,6 +135,36 @@ def test_parse_index_fn_escape_hatch():
         parse_index_fn=lambda html, url: IndexResult("T", "id", 3, "https://x"))
     result = engine.parse_index(profile, "<html></html>", "https://x/novel/id.html")
     assert result == IndexResult("T", "id", 3, "https://x")
+
+
+def test_parse_metadata_real_fixture_fanmtl():
+    html = load_fixture("fanmtl_index_kks30150.html")
+    result = engine.parse_metadata(PROFILE, html)
+    assert result.alt_title == "挑夫修仙：我有5级满铭文"
+    assert result.author == "佚名"
+    assert result.status == "Ongoing"
+    assert result.genres == ["Wuxia Xianxia"]
+    assert result.rating == ""
+    assert result.synopsis and result.synopsis.startswith("Awakening to the mystery of his birth")
+
+
+def test_parse_metadata_fn_dispatches():
+    expected = MetadataResult(synopsis="S", genres=["G"], author="A",
+                               alt_title="Alt", status="Ongoing", rating="4.5")
+    profile = SiteProfile(
+        site_key="x", domains=[], chapter_link_pattern="", index_url_id_pattern="",
+        chapter_number_fallback_pattern="", chapter_count_pattern="",
+        chapter_url_template="", parse_metadata_fn=lambda html: expected)
+    result = engine.parse_metadata(profile, "<html></html>")
+    assert result == expected
+
+
+def test_parse_metadata_raises_notimplementederror_when_unconfigured():
+    profile = SiteProfile(
+        site_key="x", domains=[], chapter_link_pattern="", index_url_id_pattern="",
+        chapter_number_fallback_pattern="", chapter_count_pattern="", chapter_url_template="")
+    with pytest.raises(NotImplementedError):
+        engine.parse_metadata(profile, "<html></html>")
 
 
 def test_chapter_url_formats_template():

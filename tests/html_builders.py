@@ -23,3 +23,18 @@ def fanmtl_index_html(chapter_id, total, title="Test Novel",
 
 def fanmtl_index_html_no_links(title="Test Novel"):
     return f"<html><body><h1>{title}</h1></body></html>"
+
+
+def fanmtl_catalog_html(entries):
+    """entries: list of (title, chapter_id, chapters, status) tuples -> a
+    catalog browse page (CATALOG_URL_TEMPLATE) with one li.novel-item per
+    entry, shaped to match parse_fanmtl_catalog_page's selectors."""
+    cards = "".join(f'''
+<li class="novel-item">
+<a href="/novel/{chapter_id}.html" title="{title}">
+<h4 class="novel-title">{title}</h4>
+<div class="novel-stats"><span><i class="material-icons">book</i> {chapters} Chapters</span></div>
+<div class="novel-stats">Status: <span class="status">{status}</span></div>
+</a>
+</li>''' for title, chapter_id, chapters, status in entries)
+    return f'<html><body><ul class="novel-list">{cards}</ul></body></html>'
