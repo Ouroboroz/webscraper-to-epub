@@ -738,6 +738,8 @@ def test_cmd_mail_pacing_file_flag_persists_widened_interval_on_429(monkeypatch,
                                                           headers={"Retry-After": "15"})})
     monkeypatch.setattr(update, "_session_for", lambda url: session)
     monkeypatch.setattr(update, "load_mail_config", lambda path: mail_config())
+    alert_recorder = SendAlertRecorder()
+    monkeypatch.setattr(update, "send_failure_alert", alert_recorder)
 
     args = argparse.Namespace(site_key="fanmtl", chapter_id=CHAPTER_ID, cache_dir=".cache",
                                delay=0, library=library_path, mail_config="unused",
