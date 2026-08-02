@@ -1,6 +1,8 @@
 import requests
 
 from epub_scraper import cache
+from epub_scraper.fetcher import ChallengeDetected
+from epub_scraper.pacing import Pacer
 from epub_scraper.scrape import scrape_chapters
 from epub_scraper.sites.fanmtl import PROFILE
 from fakes import FakeResponse, FakeSession
@@ -236,3 +238,69 @@ def test_chapters_list_preserves_iteration_order_of_chapter_range(cache_dir):
                                       cache_dir=cache_dir)
 
     assert [title for title, _ in chapters] == ["Chapter 5", "Chapter 3", "Chapter 1"]
+
+
+# -- pacer wiring -----------------------------------------------------------
+
+def test_429_response_throttles_pacer(cache_dir, tmp_path):
+    pacer = Pacer.load(str(tmp_path / "pacing.json"), default_interval=2.5)
+    session = FakeSession({url_for(1): FakeResponse("", 429, url_for(1), headers={"Retry-After": "30"})})
+
+    scrape_chapters(PROFILE, session, BASE_URL, CHAPTER_ID, [1],
+                     cache_dir=cache_dir, pacer=pacer)
+
+    assert pacer.current_interval(PROFILE.site_key) == 30.0
+
+
+def test_challenge_detected_throttles_pacer(cache_dir, tmp_path):
+    pacer = Pacer.load(str(tmp_path / "pacing.json"), default_interval=2.5)
+    session = FakeSession({url_for(1): FakeResponse("Just a moment...", 200, url_for(1))})
+
+    scrape_chapters(PROFILE, session, BASE_URL, CHAPTER_ID, [1],
+                     cache_dir=cache_dir, pacer=pacer)
+
+    assert pacer.current_interval(PROFILE.site_key) == 5.0  # 2.5 * BACKOFF_FACTOR
+
+
+def test_challenge_detected_is_labeled_distinctly_in_progress_cb(cache_dir, tmp_path):
+    pacer = Pacer.load(str(tmp_path / "pacing.json"), default_interval=2.5)
+    session = FakeSession({url_for(1): FakeResponse("Just a moment...", 200, url_for(1))})
+    progress = ProgressRecorder()
+
+    scrape_chapters(PROFILE, session, BASE_URL, CHAPTER_ID, [1],
+                     cache_dir=cache_dir, pacer=pacer, progress_cb=progress)
+
+    assert progress.calls[0][3] == "skip"
+    assert progress.calls[0][4] == "challenge page"
+
+
+def test_sleep_uses_pacer_gap_when_pacer_provided(monkeypatch, cache_dir, tmp_path):
+    pacer = Pacer.load(str(tmp_path / "pacing.json"), default_interval=2.5)
+    monkeypatch.setattr(pacer, "gap", lambda site_key: 9.87)
+    sleep_calls = []
+    monkeypatch.setattr("time.sleep", lambda s: sleep_calls.append(s))
+
+    session = FakeSession({
+        url_for(1): FakeResponse(chapter_page(1), 200, url_for(1)),
+        url_for(2): FakeResponse(chapter_page(2), 200, url_for(2)),
+    })
+
+    scrape_chapters(PROFILE, session, BASE_URL, CHAPTER_ID, [1, 2],
+                     cache_dir=cache_dir, pacer=pacer)
+
+    assert sleep_calls == [9.87]
+
+
+def test_no_pacer_falls_back_to_fixed_delay(monkeypatch, cache_dir):
+    # Regression: unchanged behavior when pacer isn't passed at all.
+    sleep_calls = []
+    monkeypatch.setattr("time.sleep", lambda s: sleep_calls.append(s))
+    session = FakeSession({
+        url_for(1): FakeResponse(chapter_page(1), 200, url_for(1)),
+        url_for(2): FakeResponse(chapter_page(2), 200, url_for(2)),
+    })
+
+    scrape_chapters(PROFILE, session, BASE_URL, CHAPTER_ID, [1, 2],
+                     cache_dir=cache_dir, delay=1.23)
+
+    assert sleep_calls == [1.23]

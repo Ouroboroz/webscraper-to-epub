@@ -4,12 +4,12 @@ import requests
 
 from . import engine
 from .cache import load_cached, save_cache
-from .fetcher import fetch
+from .fetcher import ChallengeDetected, fetch
 
 
 def scrape_chapters(profile, session, base_url, chapter_id, chapter_range,
-                     cache_dir=".cache", no_cache=False, delay=2.5, progress_cb=None,
-                     max_consecutive_failures=None):
+                     cache_dir=".cache", no_cache=False, delay=2.5, pacer=None,
+                     progress_cb=None, max_consecutive_failures=None):
     """Fetch+cache+parse each n in chapter_range (cache checked before network,
     per-chapter). progress_cb(i, total, n, flag, label), if given, is called once
     per chapter: flag is "cache"/"web" (label = chapter title) or "skip"
@@ -19,6 +19,11 @@ def scrape_chapters(profile, session, base_url, chapter_id, chapter_range,
     many real fetch/parse attempts have failed BACK TO BACK (any success resets
     the streak to 0). None preserves the original behavior of always attempting
     every chapter in chapter_range regardless of failures.
+
+    pacer: an epub_scraper.pacing.Pacer, or None. When given, it replaces the
+    fixed `delay` sleep with a jittered gap, and a 429 or ChallengeDetected
+    widens its learned interval for profile.site_key. When None, behavior is
+    unchanged from before pacer support existed (fixed time.sleep(delay)).
 
     Returns (chapters, failed_ns, stopped_at):
       chapters:   list[(title, body_html)] for every chapter that succeeded, in order
@@ -52,7 +57,16 @@ def scrape_chapters(profile, session, base_url, chapter_id, chapter_range,
             if progress_cb:
                 progress_cb(i, total, n, src, ch_title)
         except Exception as e:
-            label = f"HTTP {e.response.status_code}" if isinstance(e, requests.HTTPError) else str(e)
+            if isinstance(e, requests.HTTPError):
+                label = f"HTTP {e.response.status_code}"
+                if pacer is not None and e.response.status_code == 429:
+                    pacer.throttled(profile.site_key, retry_after=e.response.headers.get("Retry-After"))
+            elif isinstance(e, ChallengeDetected):
+                label = "challenge page"
+                if pacer is not None:
+                    pacer.throttled(profile.site_key)
+            else:
+                label = str(e)
             failed_ns.append(n)
             if progress_cb:
                 progress_cb(i, total, n, "skip", label)
@@ -65,6 +79,9 @@ def scrape_chapters(profile, session, base_url, chapter_id, chapter_range,
             break
 
         if i < total - 1 and src == "web":
-            time.sleep(delay)
+            if pacer is not None:
+                time.sleep(pacer.gap(profile.site_key))
+            else:
+                time.sleep(delay)
 
     return chapters, failed_ns, stopped_at
