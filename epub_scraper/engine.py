@@ -16,14 +16,19 @@ def _escape_xhtml(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-_HIDDEN_STYLE_MARKERS = ("display:none", "visibility:hidden", "opacity:0")
+_HIDDEN_STYLE_MARKERS = ("display:none", "visibility:hidden")
+# Anchored so "opacity:0" doesn't prefix-match "opacity:0.85" -- a perfectly
+# visible link. Dropping a legitimate chapter link is the expensive direction
+# of a false positive here, since it happens silently.
+_HIDDEN_OPACITY_RE = re.compile(r"opacity:0(\.0+)?(;|$)")
 
 
 def _is_safe_link(a):
     rel = a.get("rel") or []
     if isinstance(rel, str):
         rel = rel.split()
-    if "nofollow" in rel:
+    # HTML link types are ASCII case-insensitive per spec: rel="NoFollow" counts.
+    if any(r.lower() == "nofollow" for r in rel):
         return False
     if a.has_attr("hidden"):
         return False
@@ -31,6 +36,8 @@ def _is_safe_link(a):
         return False
     style = (a.get("style") or "").lower().replace(" ", "")
     if any(marker in style for marker in _HIDDEN_STYLE_MARKERS):
+        return False
+    if _HIDDEN_OPACITY_RE.search(style):
         return False
     return True
 

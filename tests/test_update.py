@@ -7,6 +7,7 @@ import pytest
 import requests
 
 from epub_scraper import cache, update
+from epub_scraper.fetcher import ChallengeDetected
 from epub_scraper.library import add_novel, load_library, save_library
 from epub_scraper.mailer import MailConfig, MailConfigError, MailSendError, SanityCheckError
 from epub_scraper.pacing import Pacer
@@ -109,6 +110,69 @@ def test_check_one_raises_when_index_fetch_fails_direct_call(monkeypatch, cache_
     entry = make_entry()
     with pytest.raises(requests.HTTPError):
         update._check_one(entry, cache_dir, delay=0, dry_run=False)
+
+
+def test_check_one_index_429_widens_pacer_and_still_raises(monkeypatch, cache_dir, tmp_path):
+    # The index page is the first and most exposed request of a check; a block
+    # here has to feed the same learned backoff as a block mid-chapter.
+    session = FakeSession({INDEX_URL: FakeResponse("", 429, INDEX_URL,
+                                                    headers={"Retry-After": "45"})})
+    use_session(monkeypatch, session)
+    pacer = Pacer.load(str(tmp_path / "pacing.json"), default_interval=2.5)
+    entry = make_entry()
+
+    with pytest.raises(requests.HTTPError):  # error handling itself is unchanged
+        update._check_one(entry, cache_dir, delay=0, dry_run=False, pacer=pacer)
+
+    assert pacer.current_interval("fanmtl") == 45.0
+
+
+def test_check_one_index_challenge_widens_pacer_and_still_raises(monkeypatch, cache_dir, tmp_path):
+    body = ("<html><head><title>Just a moment...</title></head>"
+            "<body>Checking your browser</body></html>")
+    session = FakeSession({INDEX_URL: FakeResponse(body, 200, INDEX_URL)})
+    use_session(monkeypatch, session)
+    pacer = Pacer.load(str(tmp_path / "pacing.json"), default_interval=2.5)
+    entry = make_entry()
+
+    with pytest.raises(ChallengeDetected):
+        update._check_one(entry, cache_dir, delay=0, dry_run=False, pacer=pacer)
+
+    assert pacer.current_interval("fanmtl") == 5.0  # 2.5 * BACKOFF_FACTOR
+
+
+def test_check_one_index_500_does_not_widen_pacer(monkeypatch, cache_dir, tmp_path):
+    # Only a 429 or a challenge page is the site pushing back; a plain 500 isn't.
+    session = FakeSession({INDEX_URL: FakeResponse("", 500, INDEX_URL)})
+    use_session(monkeypatch, session)
+    pacer = Pacer.load(str(tmp_path / "pacing.json"), default_interval=2.5)
+
+    with pytest.raises(requests.HTTPError):
+        update._check_one(make_entry(), cache_dir, delay=0, dry_run=False, pacer=pacer)
+
+    assert pacer.intervals == {}
+
+
+def test_cmd_check_index_429_persists_widened_interval(monkeypatch, tmp_path):
+    library_path = str(tmp_path / "library.json")
+    pacing_file = str(tmp_path / "pacing.json")
+    lib = {"novels": []}
+    add_novel(lib, site_key="fanmtl", chapter_id=CHAPTER_ID, index_url=INDEX_URL,
+              title="T", output_file="epubs/x.epub", last_known_chapter=0)
+    save_library(lib, library_path)
+
+    session = FakeSession({INDEX_URL: FakeResponse("", 429, INDEX_URL,
+                                                    headers={"Retry-After": "35"})})
+    monkeypatch.setattr(update, "_session_for", lambda url: session)
+
+    args = argparse.Namespace(library=library_path, cache_dir=str(tmp_path / ".cache"), delay=0,
+                               novel_delay=0, only=None, dry_run=False,
+                               email=False, email_threshold=100, mail_config="unused",
+                               pacing_file=pacing_file)
+    update.cmd_check(args)  # the novel errors, but the run itself completes
+
+    with open(pacing_file, encoding="utf-8") as f:
+        assert json.load(f)["fanmtl"] == 35.0
 
 
 def test_check_one_chapter_id_drift_prints_warning_and_keeps_stored_id(monkeypatch, cache_dir, capsys):
@@ -741,7 +805,8 @@ def test_cmd_mail_pacing_file_flag_persists_widened_interval_on_429(monkeypatch,
     alert_recorder = SendAlertRecorder()
     monkeypatch.setattr(update, "send_failure_alert", alert_recorder)
 
-    args = argparse.Namespace(site_key="fanmtl", chapter_id=CHAPTER_ID, cache_dir=".cache",
+    args = argparse.Namespace(site_key="fanmtl", chapter_id=CHAPTER_ID,
+                               cache_dir=str(tmp_path / ".cache"),
                                delay=0, library=library_path, mail_config="unused",
                                pacing_file=pacing_file)
     with pytest.raises(SystemExit):  # the only chapter fails to send -> exits 1

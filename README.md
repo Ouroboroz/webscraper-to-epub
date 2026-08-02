@@ -46,11 +46,11 @@ want to keep up to date. Every rebuild writes to `epubs/`.
 | `add <url> [--last-known N]` | Start tracking a novel |
 | `remove <site_key> <chapter_id>` | Stop tracking a novel |
 | `list` | List everything tracked |
-| `check [--only SITE:ID ...] [--dry-run] [--email] [--email-threshold N]` | Fetch new chapters for tracked novels and rebuild their EPUBs |
+| `check [--only SITE:ID ...] [--dry-run] [--email] [--email-threshold N] [--pacing-file FILE]` | Fetch new chapters for tracked novels and rebuild their EPUBs |
 | `search <query>` | Filter tracked novels by title |
 | `find <query> [--site KEY]` | Search a site for a novel (to get its URL before `add`) |
 | `grep <query> [--context N]` | Full-text search inside downloaded epub chapters |
-| `mail <site_key> <chapter_id>` | Email a tracked novel's not-yet-sent chapters to Kindle right now (bypasses the email threshold) |
+| `mail <site_key> <chapter_id> [--pacing-file FILE]` | Email a tracked novel's not-yet-sent chapters to Kindle right now (bypasses the email threshold) |
 
 Examples:
 
@@ -83,11 +83,20 @@ Every fetch goes through a few cheap defenses adapted from reviewing
   (`--pacing-file` to override the path) so the next run — including the
   next `check` under cron — starts already slowed down instead of relearning
   the same limit from scratch. The interval only ever widens, never shrinks
-  back down automatically.
-- **Challenge-page detection.** A `200` response whose body looks like a
+  back down automatically: **delete `pacing.json` to reset every site's
+  learned interval** back to whatever `--delay` says. A `--delay` larger than
+  the learned value still wins meanwhile, since it's read as a floor — asking
+  to be more polite than what was learned is always honoured.
+- **Challenge-page detection.** A `200` response that looks like a
   bot-challenge/interstitial page (rather than real chapter content) is
-  treated as a failure and triggers the same backoff as a `429`, instead of
-  silently being cached and shipped into the EPUB as garbage.
+  treated as a failure and triggers the same backoff as a `429` — on chapter
+  fetches *and* on the index-page fetch that opens every run — instead of
+  silently being cached and shipped into the EPUB as garbage. Vendor tokens
+  (`cf-browser-verification`, `ddos-guard`, …) are matched anywhere in the
+  response; giveaway *phrases* like "just a moment" are only trusted inside
+  `<title>`, since they're ordinary English that turns up in real translated
+  prose ("Just a moment later, he turned around.") and a false positive here
+  would discard a good chapter and widen that site's pacing for nothing.
 - **Honeypot-link filtering.** When scanning a novel's index page for its
   chapter ID, links that are `rel=nofollow`, `hidden`, `aria-hidden="true"`,
   or hidden via inline `display:none`/`visibility:hidden`/`opacity:0` are

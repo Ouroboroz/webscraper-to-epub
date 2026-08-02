@@ -28,7 +28,7 @@ import requests
 
 from . import engine
 from .epub_writer import build_epub
-from .fetcher import HEADERS, fetch
+from .fetcher import HEADERS, fetch, note_throttle
 from .pacing import DEFAULT_PACING_PATH, Pacer
 from .scrape import scrape_chapters
 from .sites import PROFILES, resolve_profile
@@ -73,6 +73,9 @@ def main():
     try:
         index_html = fetch(args.url, session)
     except Exception as e:
+        # The index page is the first and most exposed request of the run, so a
+        # block here is the most likely place to learn a site's real limit.
+        note_throttle(pacer, profile.site_key, e)
         print(f"Error fetching index: {e}")
         sys.exit(1)
 

@@ -28,7 +28,7 @@ import requests
 
 from . import engine
 from .epub_writer import build_epub
-from .fetcher import HEADERS, fetch
+from .fetcher import HEADERS, fetch, note_throttle
 from .library import (DEFAULT_LIBRARY_PATH, add_novel, find_novel, load_library,
                        record_check, record_email, remove_novel, save_library)
 from .mailer import (DEFAULT_MAIL_CONFIG_PATH, MailConfigError, MailSendError,
@@ -276,7 +276,14 @@ def _check_one(entry, cache_dir, delay, dry_run, library=None, library_path=None
         return "error"
 
     session = _session_for(entry["index_url"])
-    index_html = fetch(entry["index_url"], session)
+    try:
+        index_html = fetch(entry["index_url"], session)
+    except Exception as e:
+        # The index page is the first and most exposed request of a check, so a
+        # block here is the most likely place to learn a site's real limit. The
+        # error itself still propagates to cmd_check's per-novel handler.
+        note_throttle(pacer, profile.site_key, e)
+        raise
     title, parsed_id, total, base_url = engine.parse_index(profile, index_html, entry["index_url"])
 
     if parsed_id and parsed_id != entry["chapter_id"]:

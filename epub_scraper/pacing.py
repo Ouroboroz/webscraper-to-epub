@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import tempfile
 
 DEFAULT_PACING_PATH = "pacing.json"
 
@@ -22,14 +23,39 @@ class Pacer:
 
     @classmethod
     def load(cls, path=DEFAULT_PACING_PATH, default_interval=2.5):
+        """Read learned per-site intervals from `path`, tolerating a damaged file.
+
+        Unlike library.json -- irreplaceable user data, where load_library()
+        deliberately raises rather than silently losing entries -- pacing.json
+        is a derived cache: every value in it is re-learned the next time a site
+        pushes back. So a corrupt file here must NOT be fatal. Pacer.load() runs
+        once per `check` run, before the per-novel loop and outside any
+        try/except, and throttled() rewrites the file on every 429 -- so a cron
+        job killed mid-write would otherwise take down every future scheduled
+        run until someone deleted the file by hand.
+        """
         intervals = {}
         if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                intervals = json.load(f)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError(f"expected a JSON object, got {type(data).__name__}")
+                # Coerce: a hand-edited file can easily hold "5.0" instead of 5.0.
+                intervals = {str(k): float(v) for k, v in data.items()}
+            except (OSError, TypeError, ValueError) as e:
+                print(f"warning: ignoring unreadable {path} ({e}); "
+                      f"starting from default pacing intervals")
+                intervals = {}
         return cls(path, default_interval, intervals)
 
     def current_interval(self, site_key):
-        return self.intervals.get(site_key, self.default_interval)
+        """The learned value wins when it is larger (that's the whole point of
+        persisting backoff), but `default_interval` acts as a FLOOR: a user who
+        explicitly passes `--delay 30` to be extra polite must not have it
+        silently ignored just because this site has some smaller value on
+        record from a long-past throttle."""
+        return max(self.intervals.get(site_key, 0.0), self.default_interval)
 
     def gap(self, site_key):
         mean = self.current_interval(site_key)
@@ -52,8 +78,19 @@ class Pacer:
         return widened
 
     def save(self):
-        dirname = os.path.dirname(self.path)
-        if dirname:
-            os.makedirs(dirname, exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as f:
-            json.dump(self.intervals, f, indent=2)
+        """Write atomically -- temp file in the same directory, then
+        os.replace() -- exactly as library.save_library() does. throttled()
+        saves on every single 429, so a run killed mid-write must never be able
+        to leave a truncated pacing.json behind."""
+        directory = os.path.dirname(os.path.abspath(self.path)) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".pacing.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.intervals, f, indent=2)
+                f.write("\n")
+            os.replace(tmp_path, self.path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise

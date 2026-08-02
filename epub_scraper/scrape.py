@@ -4,7 +4,7 @@ import requests
 
 from . import engine
 from .cache import load_cached, save_cache
-from .fetcher import ChallengeDetected, fetch
+from .fetcher import ChallengeDetected, fetch, note_throttle
 
 
 def scrape_chapters(profile, session, base_url, chapter_id, chapter_range,
@@ -41,12 +41,17 @@ def scrape_chapters(profile, session, base_url, chapter_id, chapter_range,
     for i, n in enumerate(chapter_range):
         url = engine.chapter_url(profile, base_url, chapter_id, n)
         src = None
+        # src only becomes "web" on SUCCESS; this records that a real request
+        # went out at all, so the pacing sleep below still fires when that
+        # request failed -- a rate-limit event is exactly when it matters most.
+        attempted_web = False
         try:
             cached = None if no_cache else load_cached(cache_dir, chapter_id, n)
             if cached:
                 html = cached
                 src = "cache"
             else:
+                attempted_web = True
                 html = fetch(url, session)
                 save_cache(cache_dir, chapter_id, n, html)
                 src = "web"
@@ -57,14 +62,11 @@ def scrape_chapters(profile, session, base_url, chapter_id, chapter_range,
             if progress_cb:
                 progress_cb(i, total, n, src, ch_title)
         except Exception as e:
+            note_throttle(pacer, profile.site_key, e)
             if isinstance(e, requests.HTTPError):
                 label = f"HTTP {e.response.status_code}"
-                if pacer is not None and e.response.status_code == 429:
-                    pacer.throttled(profile.site_key, retry_after=e.response.headers.get("Retry-After"))
             elif isinstance(e, ChallengeDetected):
                 label = "challenge page"
-                if pacer is not None:
-                    pacer.throttled(profile.site_key)
             else:
                 label = str(e)
             failed_ns.append(n)
@@ -78,7 +80,7 @@ def scrape_chapters(profile, session, base_url, chapter_id, chapter_range,
             stopped_at = streak_start_n
             break
 
-        if i < total - 1 and src == "web":
+        if i < total - 1 and (src == "web" or (pacer is not None and attempted_web)):
             if pacer is not None:
                 time.sleep(pacer.gap(profile.site_key))
             else:

@@ -163,6 +163,55 @@ def test_parse_index_skips_decoy_link_in_fallback_max_scan():
     assert result.total == 1
 
 
+def test_parse_index_skips_fully_transparent_decoy_link():
+    html = ('<html><body><h1>Test Novel</h1>'
+            '<a href="/novel/decoy_999.html" style="opacity: 0">Ch 999</a>'
+            '<a href="/novel/abc_1.html">Chapter 1</a>'
+            '</body></html>')
+    result = engine.parse_index(PROFILE, html, "https://www.fanmtl.com/novel/abc.html")
+    assert result.chapter_id == "abc"
+    assert result.total == 1  # 999 would leak through if the decoy weren't skipped
+
+
+def test_parse_index_keeps_partially_transparent_link():
+    # opacity:0.85 is a perfectly visible link -- prefix-matching "opacity:0"
+    # silently dropped it. The index URL here deliberately does NOT match the
+    # chapter_id fallback pattern, so the link is the only possible source.
+    html = ('<html><body><h1>Test Novel</h1>'
+            '<a href="/novel/abc_1.html" style="opacity:0.85">Chapter 1</a>'
+            '</body></html>')
+    result = engine.parse_index(PROFILE, html, "https://www.fanmtl.com/not-a-novel-url")
+    assert result.chapter_id == "abc"
+    assert result.total == 1
+
+
+def test_parse_index_keeps_link_with_opacity_one():
+    html = ('<html><body><h1>Test Novel</h1>'
+            '<a href="/novel/abc_1.html" style="opacity:1;color:red">Chapter 1</a>'
+            '</body></html>')
+    result = engine.parse_index(PROFILE, html, "https://www.fanmtl.com/not-a-novel-url")
+    assert result.chapter_id == "abc"
+
+
+def test_parse_index_skips_zero_opacity_followed_by_another_declaration():
+    html = ('<html><body><h1>Test Novel</h1>'
+            '<a href="/novel/decoy_999.html" style="opacity:0;color:red">Ch 999</a>'
+            '<a href="/novel/abc_1.html">Chapter 1</a>'
+            '</body></html>')
+    result = engine.parse_index(PROFILE, html, "https://www.fanmtl.com/novel/abc.html")
+    assert result.total == 1
+
+
+def test_parse_index_skips_mixed_case_nofollow_decoy():
+    # HTML link types are ASCII case-insensitive per spec.
+    html = ('<html><body><h1>Test Novel</h1>'
+            '<a href="/novel/abc_1.html">Chapter 1</a>'
+            '<a href="/novel/abc_999.html" rel="NoFollow">Decoy</a>'
+            '</body></html>')
+    result = engine.parse_index(PROFILE, html, "https://www.fanmtl.com/novel/abc.html")
+    assert result.total == 1
+
+
 def test_parse_index_normal_links_without_decoys_are_unaffected():
     html = fanmtl_index_html(chapter_id="abc", total=5, with_count_text=False)
     result = engine.parse_index(PROFILE, html, "https://www.fanmtl.com/novel/abc.html")

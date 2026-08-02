@@ -4,6 +4,9 @@
 # Scheduled-update-check runtime state (mutates every run; not committed config)
 library.json
 pacing.json
+# Atomic-write temp files, if a run is ever killed between mkstemp and os.replace
+.library.*.tmp
+.pacing.*.tmp
 .update_check.lock
 logs/
 
