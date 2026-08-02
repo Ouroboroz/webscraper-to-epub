@@ -1,5 +1,6 @@
 import argparse
 import copy
+import json
 import os
 
 import pytest
@@ -8,6 +9,7 @@ import requests
 from epub_scraper import cache, update
 from epub_scraper.library import add_novel, load_library, save_library
 from epub_scraper.mailer import MailConfig, MailConfigError, MailSendError, SanityCheckError
+from epub_scraper.pacing import Pacer
 from epub_scraper.sites import PROFILES
 from conftest import load_fixture
 from fakes import FakeResponse, FakeSession
@@ -649,7 +651,8 @@ def test_cmd_mail_sends_even_far_below_threshold(monkeypatch, cache_dir, tmp_pat
     monkeypatch.setattr(update, "send_epub_to_kindle", recorder)
 
     args = argparse.Namespace(site_key="fanmtl", chapter_id=CHAPTER_ID, cache_dir=cache_dir,
-                               delay=0, library=library_path, mail_config="unused")
+                               delay=0, library=library_path, mail_config="unused",
+                               pacing_file=str(tmp_path / "pacing.json"))
     update.cmd_mail(args)
 
     assert len(recorder.calls) == 1
@@ -669,7 +672,8 @@ def test_cmd_mail_nothing_pending_prints_message_and_does_not_exit(monkeypatch, 
     monkeypatch.setattr(update, "_session_for", lambda url: FakeSession(strict=True))
 
     args = argparse.Namespace(site_key="fanmtl", chapter_id=CHAPTER_ID, cache_dir=".cache",
-                               delay=0, library=library_path, mail_config="unused")
+                               delay=0, library=library_path, mail_config="unused",
+                               pacing_file=str(tmp_path / "pacing.json"))
     update.cmd_mail(args)  # must not raise SystemExit
     assert "Nothing new to send since chapter 5" in capsys.readouterr().out
 
@@ -677,7 +681,8 @@ def test_cmd_mail_nothing_pending_prints_message_and_does_not_exit(monkeypatch, 
 def test_cmd_mail_untracked_entry_exits_1(tmp_path):
     library_path = str(tmp_path / "library.json")
     args = argparse.Namespace(site_key="fanmtl", chapter_id="nope", cache_dir=".cache",
-                               delay=0, library=library_path, mail_config="unused")
+                               delay=0, library=library_path, mail_config="unused",
+                               pacing_file=str(tmp_path / "pacing.json"))
     with pytest.raises(SystemExit) as exc_info:
         update.cmd_mail(args)
     assert exc_info.value.code == 1
@@ -695,7 +700,8 @@ def test_cmd_mail_bad_config_exits_1(monkeypatch, tmp_path):
     monkeypatch.setattr(update, "load_mail_config", _raise)
 
     args = argparse.Namespace(site_key="fanmtl", chapter_id=CHAPTER_ID, cache_dir=".cache",
-                               delay=0, library=library_path, mail_config="unused")
+                               delay=0, library=library_path, mail_config="unused",
+                               pacing_file=str(tmp_path / "pacing.json"))
     with pytest.raises(SystemExit) as exc_info:
         update.cmd_mail(args)
     assert exc_info.value.code == 1
@@ -713,10 +719,35 @@ def test_cmd_mail_send_batch_failure_exits_1(monkeypatch, tmp_path):
     monkeypatch.setattr(update, "_send_batch", lambda *a, **kw: "failed")
 
     args = argparse.Namespace(site_key="fanmtl", chapter_id=CHAPTER_ID, cache_dir=".cache",
-                               delay=0, library=library_path, mail_config="unused")
+                               delay=0, library=library_path, mail_config="unused",
+                               pacing_file=str(tmp_path / "pacing.json"))
     with pytest.raises(SystemExit) as exc_info:
         update.cmd_mail(args)
     assert exc_info.value.code == 1
+
+
+def test_cmd_mail_pacing_file_flag_persists_widened_interval_on_429(monkeypatch, tmp_path):
+    library_path = str(tmp_path / "library.json")
+    pacing_file = str(tmp_path / "pacing.json")
+    lib = {"novels": []}
+    add_novel(lib, site_key="fanmtl", chapter_id=CHAPTER_ID, index_url=INDEX_URL,
+              title="T", output_file="epubs/x.epub", last_known_chapter=1)
+    save_library(lib, library_path)
+
+    session = FakeSession({chapter_url(1): FakeResponse("", 429, chapter_url(1),
+                                                          headers={"Retry-After": "15"})})
+    monkeypatch.setattr(update, "_session_for", lambda url: session)
+    monkeypatch.setattr(update, "load_mail_config", lambda path: mail_config())
+
+    args = argparse.Namespace(site_key="fanmtl", chapter_id=CHAPTER_ID, cache_dir=".cache",
+                               delay=0, library=library_path, mail_config="unused",
+                               pacing_file=pacing_file)
+    with pytest.raises(SystemExit):  # the only chapter fails to send -> exits 1
+        update.cmd_mail(args)
+
+    with open(pacing_file, encoding="utf-8") as f:
+        data = json.load(f)
+    assert data["fanmtl"] == 15.0
 
 
 # ===== cmd_check --email (via _check_one) ==========================================
@@ -893,7 +924,8 @@ def test_cmd_check_email_one_novel_failure_does_not_abort_loop(monkeypatch, tmp_
 
     args = argparse.Namespace(library=library_path, cache_dir=cache_dir, delay=0,
                                novel_delay=0, only=None, dry_run=False,
-                               email=True, email_threshold=100, mail_config="unused")
+                               email=True, email_threshold=100, mail_config="unused",
+                               pacing_file=str(tmp_path / "pacing.json"))
     update.cmd_check(args)
 
     out = capsys.readouterr().out
@@ -918,10 +950,36 @@ def test_cmd_check_missing_mail_config_exits_1_before_any_target_checked(monkeyp
 
     args = argparse.Namespace(library=library_path, cache_dir=".cache", delay=0,
                                novel_delay=0, only=None, dry_run=False,
-                               email=True, email_threshold=100, mail_config="unused")
+                               email=True, email_threshold=100, mail_config="unused",
+                               pacing_file=str(tmp_path / "pacing.json"))
     with pytest.raises(SystemExit) as exc_info:
         update.cmd_check(args)
     assert exc_info.value.code == 1
+
+
+def test_cmd_check_pacing_file_flag_persists_widened_interval_on_429(monkeypatch, tmp_path):
+    library_path = str(tmp_path / "library.json")
+    pacing_file = str(tmp_path / "pacing.json")
+    lib = {"novels": []}
+    add_novel(lib, site_key="fanmtl", chapter_id=CHAPTER_ID, index_url=INDEX_URL,
+              title="T", output_file="epubs/x.epub", last_known_chapter=0)
+    save_library(lib, library_path)
+
+    session = FakeSession({
+        INDEX_URL: FakeResponse(index_page(total=1), 200, INDEX_URL),
+        chapter_url(1): FakeResponse("", 429, chapter_url(1), headers={"Retry-After": "12"}),
+    })
+    monkeypatch.setattr(update, "_session_for", lambda url: session)
+
+    args = argparse.Namespace(library=library_path, cache_dir=str(tmp_path / ".cache"), delay=0,
+                               novel_delay=0, only=None, dry_run=False,
+                               email=False, email_threshold=100, mail_config="unused",
+                               pacing_file=pacing_file)
+    update.cmd_check(args)
+
+    with open(pacing_file, encoding="utf-8") as f:
+        data = json.load(f)
+    assert data["fanmtl"] == 12.0
 
 
 # ===== _parse_only ================================================================

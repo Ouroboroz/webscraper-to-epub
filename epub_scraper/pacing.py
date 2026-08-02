@@ -33,6 +33,8 @@ class Pacer:
 
     def gap(self, site_key):
         mean = self.current_interval(site_key)
+        if mean <= 0:
+            return 0.0
         draw = random.gammavariate(GAMMA_SHAPE, mean / GAMMA_SHAPE)
         return min(max(draw, mean * 0.2), mean * 3.0)
 

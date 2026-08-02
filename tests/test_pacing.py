@@ -32,6 +32,14 @@ def test_gap_stays_within_floor_and_ceiling(tmp_path):
     assert all(0.8 <= g <= 12.0 for g in gaps)  # 0.2x .. 3x of mean=4.0
 
 
+def test_gap_with_zero_default_interval_returns_zero(tmp_path):
+    # A caller may deliberately configure a zero delay (e.g. fast tests); the
+    # gamma distribution is undefined for a zero mean, so this must short-circuit
+    # rather than raise.
+    pacer = Pacer.load(str(tmp_path / "pacing.json"), default_interval=0)
+    assert pacer.gap("fanmtl") == 0.0
+
+
 def test_throttled_with_retry_after_sets_interval(tmp_path):
     pacer = Pacer.load(str(tmp_path / "pacing.json"), default_interval=2.5)
     widened = pacer.throttled("fanmtl", retry_after="30")
