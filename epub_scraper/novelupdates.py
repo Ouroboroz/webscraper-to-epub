@@ -63,11 +63,39 @@ class ChallengeExpired(Exception):
     never solved), caller should re-solve and retry."""
 
 
+def _challenge_page_reason(html):
+    """Which marker (if any) makes `html` look like a Cloudflare interstitial
+    -- exposed separately from looks_like_challenge_page so a failed solve
+    can report *why* it thinks it's still blocked, instead of just that it is."""
+    if "<title>Just a moment" in html:
+        return "title is 'Just a moment...'"
+    if "cf_chl_opt" in html:
+        return "cf_chl_opt marker present"
+    return None
+
+
 def looks_like_challenge_page(html):
     """True if `html` is a Cloudflare interstitial rather than real content --
     checked before parsing so a stale/expired session fails loudly instead of
     silently producing an empty/garbage NUSeriesMetadata."""
-    return "<title>Just a moment" in html or "cf_chl_opt" in html
+    return _challenge_page_reason(html) is not None
+
+
+def _dump_debug(sb):
+    """Best-effort page-source + screenshot dump when a solve attempt fails,
+    so the next real-hardware run gives a concrete artifact to diagnose from
+    instead of another blind guess. Written to the current directory --
+    gitignored, not meant to be committed."""
+    try:
+        with open("nu_challenge_debug.html", "w", encoding="utf-8") as f:
+            f.write(sb.driver.page_source)
+    except Exception as e:
+        print(f"  (failed to write nu_challenge_debug.html: {e})")
+    try:
+        sb.driver.save_screenshot("nu_challenge_debug.png")
+    except Exception as e:
+        print(f"  (failed to write nu_challenge_debug.png: {e})")
+    print("  wrote nu_challenge_debug.html / nu_challenge_debug.png for inspection")
 
 
 def solve_challenge_session(url=BASE_URL, max_solve_attempts=6, poll_delay=2.5):
@@ -94,6 +122,7 @@ def solve_challenge_session(url=BASE_URL, max_solve_attempts=6, poll_delay=2.5):
     cookies = None
     user_agent = None
 
+    last_html = None
     with SB(uc=True, test=True, xvfb=True) as sb:
         sb.uc_open_with_reconnect(url, reconnect_time=4)
         sb.uc_gui_handle_captcha()
@@ -102,7 +131,8 @@ def solve_challenge_session(url=BASE_URL, max_solve_attempts=6, poll_delay=2.5):
         # navigation/cookie-set actually lands -- poll page_source rather
         # than trusting it's done after a single call.
         for _ in range(max_solve_attempts):
-            if not looks_like_challenge_page(sb.driver.page_source):
+            last_html = sb.driver.page_source
+            if not looks_like_challenge_page(last_html):
                 solved = True
                 break
             time.sleep(poll_delay)
@@ -110,10 +140,15 @@ def solve_challenge_session(url=BASE_URL, max_solve_attempts=6, poll_delay=2.5):
         if solved:
             cookies = sb.driver.get_cookies()
             user_agent = sb.driver.execute_script("return navigator.userAgent")
+        else:
+            reason = _challenge_page_reason(last_html) if last_html else "no page loaded"
+            print(f"  still blocked after {max_solve_attempts} checks ({reason})")
+            _dump_debug(sb)
 
     if not solved:
         raise ChallengeExpired(
-            f"Still looked like a challenge page after {max_solve_attempts} checks")
+            f"Still looked like a challenge page after {max_solve_attempts} checks -- "
+            "see nu_challenge_debug.html/.png")
 
     session = cf_requests.Session(impersonate="chrome124")
     session.headers["User-Agent"] = user_agent

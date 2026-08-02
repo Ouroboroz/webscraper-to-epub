@@ -9,6 +9,10 @@ logs/
 # Classification data spine (Stage 0) runtime DB -- mutates every crawl run
 dataspine.db
 
+# Debug dump from a failed Novel Updates challenge solve
+nu_challenge_debug.html
+nu_challenge_debug.png
+
 # Kindle-mail credentials (local-only, never committed)
 .env
 
