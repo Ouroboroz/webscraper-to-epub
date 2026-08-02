@@ -1,0 +1,8 @@
+# Optional: only needed for `python -m epub_scraper.dataspine enrich` /
+# `python -m epub_scraper.novelupdates check`. Not part of the base
+# requirements.txt because it needs a real Chrome browser (and, on Linux, a
+# display or Xvfb -- see epub_scraper/novelupdates.py's docstring), which
+# users who only want FanMTL scraping/EPUB building don't need.
+-r requirements.txt
+seleniumbase
+curl_cffi
