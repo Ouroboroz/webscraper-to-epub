@@ -42,6 +42,15 @@ CREATE TABLE IF NOT EXISTS crawl_state (
     next_page INTEGER NOT NULL DEFAULT 0,
     last_crawled_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS chapters (
+    novel_id INTEGER NOT NULL REFERENCES novels(id),
+    chapter_number INTEGER NOT NULL,
+    title TEXT,
+    body TEXT,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (novel_id, chapter_number)
+);
 """
 
 
@@ -57,6 +66,15 @@ _NU_COLUMNS = [
     ("nu_votes", "TEXT"),
     ("nu_translation_groups", "TEXT"),
     ("nu_resolution", "TEXT"),  # 'auto' | 'ambiguous' | 'no_candidates'
+]
+
+# Chapter-sample tracking, added after NU enrichment shipped -- same guarded
+# ALTER TABLE approach. Not NULL <=> "chapters" attempted (successfully or
+# not) for this novel; how many actually landed lives in the chapters table
+# itself, since partial failures (a chapter 404s/decoys out) are expected and
+# shouldn't trigger endless retries of the whole novel.
+_CHAPTER_COLUMNS = [
+    ("chapters_sampled_at", "TEXT"),
 ]
 
 
@@ -75,7 +93,7 @@ def init_db(path=DEFAULT_DB_PATH):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
-    for name, decl in _NU_COLUMNS:
+    for name, decl in _NU_COLUMNS + _CHAPTER_COLUMNS:
         _ensure_column(conn, "novels", name, decl)
     conn.commit()
     return conn
@@ -276,6 +294,39 @@ def upsert_nu_metadata(conn, site_key, url, resolution, metadata=None):
         )
 
 
+def iter_candidates_missing_chapters(conn, site_key, limit=None):
+    """Candidates that still need a chapter-sample attempt -- no attempt
+    recorded yet, successful or not. Ordered by id, same resumability shape
+    as iter_candidates_missing_metadata/_nu_resolution."""
+    sql = ("SELECT * FROM novels WHERE site_key = ? AND candidate = 1 "
+           "AND chapters_sampled_at IS NULL ORDER BY id")
+    params = [site_key]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
+def upsert_chapters(conn, novel_id, chapters):
+    """chapters: list[(chapter_number, title, body)]. Always stamps
+    chapters_sampled_at on the novel, regardless of how many chapters
+    actually came back -- a novel that only yields 3/5 (a chapter 404s, gets
+    skipped as a decoy, etc.) must not be retried forever; whatever landed is
+    still a usable sample."""
+    now = now_iso()
+    for number, title, body in chapters:
+        conn.execute(
+            """
+            INSERT INTO chapters (novel_id, chapter_number, title, body, fetched_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(novel_id, chapter_number) DO UPDATE SET
+                title=excluded.title, body=excluded.body, fetched_at=excluded.fetched_at
+            """,
+            (novel_id, number, title, body, now),
+        )
+    conn.execute("UPDATE novels SET chapters_sampled_at = ? WHERE id = ?", (now, novel_id))
+
+
 def stats(conn, site_key=None):
     """Summary counts: total catalogued, candidates, candidates with metadata
     already fetched, and a status -> count breakdown among candidates."""
@@ -290,6 +341,11 @@ def stats(conn, site_key=None):
     with_metadata = conn.execute(
         f"SELECT COUNT(*) FROM novels {where}{' AND' if where else 'WHERE'} "
         "candidate = 1 AND synopsis IS NOT NULL",
+        params,
+    ).fetchone()[0]
+    with_chapters = conn.execute(
+        f"SELECT COUNT(*) FROM novels {where}{' AND' if where else 'WHERE'} "
+        "candidate = 1 AND chapters_sampled_at IS NOT NULL",
         params,
     ).fetchone()[0]
     by_status = dict(conn.execute(
@@ -307,6 +363,7 @@ def stats(conn, site_key=None):
         "total": total,
         "candidates": candidates,
         "candidates_with_metadata": with_metadata,
+        "candidates_with_chapters": with_chapters,
         "candidates_by_status": by_status,
         "candidates_by_nu_resolution": by_nu_resolution,
     }
