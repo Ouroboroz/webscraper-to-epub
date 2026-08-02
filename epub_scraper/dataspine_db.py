@@ -39,6 +39,29 @@ CREATE TABLE IF NOT EXISTS novel_tags (
 """
 
 
+# Novel Updates enrichment columns, added after the initial FanMTL-only
+# schema shipped -- guarded ALTER TABLE via _ensure_column() so existing
+# dataspine.db files pick them up without a real migration framework.
+_NU_COLUMNS = [
+    ("nu_title", "TEXT"),
+    ("nu_author", "TEXT"),
+    ("nu_status", "TEXT"),
+    ("nu_release_frequency", "TEXT"),
+    ("nu_rating", "TEXT"),
+    ("nu_votes", "TEXT"),
+    ("nu_translation_groups", "TEXT"),
+    ("nu_resolution", "TEXT"),  # 'auto' | 'ambiguous' | 'no_candidates'
+]
+
+
+def _ensure_column(conn, table, name, decl):
+    # table/name/decl are always internal literals from _NU_COLUMNS above,
+    # never user input -- f-string interpolation here is safe.
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if name not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 def init_db(path=DEFAULT_DB_PATH):
     """Open (creating if needed) the dataspine SQLite DB and ensure its schema
     exists. Returns a connection with Row-based access; callers are
@@ -46,6 +69,8 @@ def init_db(path=DEFAULT_DB_PATH):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    for name, decl in _NU_COLUMNS:
+        _ensure_column(conn, "novels", name, decl)
     conn.commit()
     return conn
 
@@ -158,6 +183,69 @@ def upsert_metadata(conn, site_key, url, metadata):
         )
 
 
+def iter_candidates_missing_nu_resolution(conn, site_key, limit=None):
+    """Candidates that still need a Novel Updates enrichment attempt -- no
+    resolution recorded yet, successful or not. Ordered by id, same
+    resumability shape as iter_candidates_missing_metadata."""
+    sql = ("SELECT * FROM novels WHERE site_key = ? AND candidate = 1 "
+           "AND nu_resolution IS NULL ORDER BY id")
+    params = [site_key]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
+def upsert_nu_metadata(conn, site_key, url, resolution, metadata=None):
+    """Record a Novel Updates entity-resolution outcome. On "auto" (metadata
+    given), fills in nu_* fields and links NU's genres/tags into
+    tags/novel_tags alongside FanMTL's. On "ambiguous"/"no_candidates", just
+    stamps nu_resolution so `enrich` treats the novel as processed (resumable)
+    -- manual/LLM adjudication for those is a separate, later concern."""
+    novel = get_novel(conn, site_key, url)
+    if novel is None:
+        raise ValueError(f"No novel row for {site_key}:{url} -- run the catalog crawl first")
+
+    if metadata is None:
+        conn.execute(
+            "UPDATE novels SET nu_resolution=?, nu_resolved_at=? WHERE id=?",
+            (resolution, now_iso(), novel["id"]),
+        )
+        return
+
+    conn.execute(
+        """
+        UPDATE novels SET
+            nu_url=:nu_url, nu_title=:nu_title, nu_author=:nu_author,
+            nu_status=:nu_status, nu_release_frequency=:nu_release_frequency,
+            nu_rating=:nu_rating, nu_votes=:nu_votes,
+            nu_translation_groups=:nu_translation_groups,
+            nu_resolution=:resolution, nu_resolved_at=:now
+        WHERE id=:id
+        """,
+        {
+            "nu_url": metadata.url,
+            "nu_title": metadata.title,
+            "nu_author": metadata.author,
+            "nu_status": metadata.translation_status,
+            "nu_release_frequency": metadata.release_frequency,
+            "nu_rating": metadata.rating,
+            "nu_votes": metadata.votes,
+            "nu_translation_groups": ", ".join(metadata.translation_groups) or None,
+            "resolution": resolution,
+            "now": now_iso(),
+            "id": novel["id"],
+        },
+    )
+
+    for name in metadata.genres + metadata.tags:
+        tag_id = _get_or_create_tag(conn, name)
+        conn.execute(
+            "INSERT OR IGNORE INTO novel_tags (novel_id, tag_id) VALUES (?, ?)",
+            (novel["id"], tag_id),
+        )
+
+
 def stats(conn, site_key=None):
     """Summary counts: total catalogued, candidates, candidates with metadata
     already fetched, and a status -> count breakdown among candidates."""
@@ -179,10 +267,16 @@ def stats(conn, site_key=None):
         "candidate = 1 GROUP BY status",
         params,
     ).fetchall())
+    by_nu_resolution = dict(conn.execute(
+        f"SELECT nu_resolution, COUNT(*) FROM novels {where}{' AND' if where else 'WHERE'} "
+        "candidate = 1 AND nu_resolution IS NOT NULL GROUP BY nu_resolution",
+        params,
+    ).fetchall())
 
     return {
         "total": total,
         "candidates": candidates,
         "candidates_with_metadata": with_metadata,
         "candidates_by_status": by_status,
+        "candidates_by_nu_resolution": by_nu_resolution,
     }

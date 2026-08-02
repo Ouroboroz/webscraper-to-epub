@@ -2,7 +2,9 @@ from epub_scraper import dataspine
 from epub_scraper.dataspine_db import get_novel, init_db
 from fakes import FakeResponse, FakeSession
 from conftest import load_fixture
-from html_builders import fanmtl_catalog_html
+from html_builders import fanmtl_catalog_html, nu_search_html, nu_series_html
+
+NU_BASE_URL = "https://www.novelupdates.com"
 
 BASE_URL = "https://www.fanmtl.com"
 
@@ -70,6 +72,95 @@ def test_cmd_metadata_fills_in_synopsis_for_pending_candidate(monkeypatch, db_pa
 def test_cmd_metadata_no_pending_candidates_prints_message(monkeypatch, db_path, capsys):
     run_cli(monkeypatch, ["metadata", "--db", db_path], FakeSession({}))
     assert "No candidates pending" in capsys.readouterr().out
+
+
+def _crawl_one(monkeypatch, db_path, chapter_id, title="A Novel"):
+    page0 = fanmtl_catalog_html([(title, chapter_id, 300, "Ongoing")])
+    session = FakeSession({
+        page_url(0): FakeResponse(page0, 200, page_url(0)),
+        page_url(1): FakeResponse(fanmtl_catalog_html([]), 200, page_url(1)),
+    })
+    run_cli(monkeypatch, ["crawl", "--db", db_path], session)
+
+
+def test_cmd_enrich_resolves_auto_match(monkeypatch, db_path):
+    _crawl_one(monkeypatch, db_path, "ri1", title="Reverend Insanity")
+
+    series_url = f"{NU_BASE_URL}/series/reverend-insanity/"
+    search_html = nu_search_html([("Reverend Insanity", series_url)])
+    series_html = nu_series_html(title="Reverend Insanity", associated_names=["Reverend Insanity"],
+                                  genres=["Action"], tags=["Cultivation"])
+    nu_session = FakeSession({
+        f"{NU_BASE_URL}/": FakeResponse(search_html, 200, f"{NU_BASE_URL}/"),
+        series_url: FakeResponse(series_html, 200, series_url),
+    })
+    monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", lambda *a, **kw: nu_session)
+
+    run_cli(monkeypatch, ["enrich", "--db", db_path], FakeSession({}))
+
+    conn = init_db(db_path)
+    novel = get_novel(conn, "fanmtl", f"{BASE_URL}/novel/ri1.html")
+    assert novel["nu_resolution"] == "auto"
+    assert novel["nu_url"] == series_url
+    assert novel["nu_title"] == "Reverend Insanity"
+
+
+def test_cmd_enrich_no_search_results_records_no_candidates(monkeypatch, db_path):
+    _crawl_one(monkeypatch, db_path, "obs1", title="Obscure Novel")
+
+    nu_session = FakeSession({
+        f"{NU_BASE_URL}/": FakeResponse(nu_search_html([]), 200, f"{NU_BASE_URL}/"),
+    })
+    monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", lambda *a, **kw: nu_session)
+
+    run_cli(monkeypatch, ["enrich", "--db", db_path], FakeSession({}))
+
+    conn = init_db(db_path)
+    novel = get_novel(conn, "fanmtl", f"{BASE_URL}/novel/obs1.html")
+    assert novel["nu_resolution"] == "no_candidates"
+    assert novel["nu_url"] is None
+
+
+def test_cmd_enrich_resolves_session_expiry_mid_run(monkeypatch, db_path):
+    _crawl_one(monkeypatch, db_path, "ri1", title="Reverend Insanity")
+
+    series_url = f"{NU_BASE_URL}/series/reverend-insanity/"
+    challenge_html = load_fixture("novelupdates_cloudflare_challenge.html")
+    search_html = nu_search_html([("Reverend Insanity", series_url)])
+    series_html = nu_series_html(title="Reverend Insanity", associated_names=["Reverend Insanity"])
+
+    call_count = {"n": 0}
+
+    def search_response():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return FakeResponse(challenge_html, 200, f"{NU_BASE_URL}/")
+        return FakeResponse(search_html, 200, f"{NU_BASE_URL}/")
+
+    nu_session = FakeSession({
+        f"{NU_BASE_URL}/": search_response,
+        series_url: FakeResponse(series_html, 200, series_url),
+    })
+
+    solve_calls = {"n": 0}
+
+    def fake_solve(*a, **kw):
+        solve_calls["n"] += 1
+        return nu_session
+
+    monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", fake_solve)
+
+    run_cli(monkeypatch, ["enrich", "--db", db_path], FakeSession({}))
+
+    assert solve_calls["n"] == 2  # initial solve + one re-solve after the challenge came back
+    conn = init_db(db_path)
+    novel = get_novel(conn, "fanmtl", f"{BASE_URL}/novel/ri1.html")
+    assert novel["nu_resolution"] == "auto"
+
+
+def test_cmd_enrich_no_pending_candidates_prints_message(monkeypatch, db_path, capsys):
+    run_cli(monkeypatch, ["enrich", "--db", db_path], FakeSession({}))
+    assert "No candidates pending Novel Updates enrichment" in capsys.readouterr().out
 
 
 def test_cmd_stats_prints_summary(monkeypatch, db_path, capsys):
