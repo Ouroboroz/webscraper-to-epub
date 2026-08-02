@@ -5,6 +5,7 @@ from conftest import load_fixture
 from html_builders import fanmtl_catalog_html, nu_search_html, nu_series_html
 
 NU_BASE_URL = "https://www.novelupdates.com"
+NU_AJAX_URL = f"{NU_BASE_URL}/wp-admin/admin-ajax.php"
 
 BASE_URL = "https://www.fanmtl.com"
 
@@ -91,7 +92,7 @@ def test_cmd_enrich_resolves_auto_match(monkeypatch, db_path):
     series_html = nu_series_html(title="Reverend Insanity", associated_names=["Reverend Insanity"],
                                   genres=["Action"], tags=["Cultivation"])
     nu_session = FakeSession({
-        f"{NU_BASE_URL}/": FakeResponse(search_html, 200, f"{NU_BASE_URL}/"),
+        NU_AJAX_URL: FakeResponse(search_html, 200, NU_AJAX_URL),
         series_url: FakeResponse(series_html, 200, series_url),
     })
     monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", lambda *a, **kw: nu_session)
@@ -109,7 +110,7 @@ def test_cmd_enrich_no_search_results_records_no_candidates(monkeypatch, db_path
     _crawl_one(monkeypatch, db_path, "obs1", title="Obscure Novel")
 
     nu_session = FakeSession({
-        f"{NU_BASE_URL}/": FakeResponse(nu_search_html([]), 200, f"{NU_BASE_URL}/"),
+        NU_AJAX_URL: FakeResponse(nu_search_html([]), 200, NU_AJAX_URL),
     })
     monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", lambda *a, **kw: nu_session)
 
@@ -134,11 +135,11 @@ def test_cmd_enrich_resolves_session_expiry_mid_run(monkeypatch, db_path):
     def search_response():
         call_count["n"] += 1
         if call_count["n"] == 1:
-            return FakeResponse(challenge_html, 200, f"{NU_BASE_URL}/")
-        return FakeResponse(search_html, 200, f"{NU_BASE_URL}/")
+            return FakeResponse(challenge_html, 200, NU_AJAX_URL)
+        return FakeResponse(search_html, 200, NU_AJAX_URL)
 
     nu_session = FakeSession({
-        f"{NU_BASE_URL}/": search_response,
+        NU_AJAX_URL: search_response,
         series_url: FakeResponse(series_html, 200, series_url),
     })
 

@@ -9,9 +9,11 @@ reached from the environment that first wrote this module -- confirmed
 working (2026-08-02, real-hardware testing) and several were corrected
 against an actual captured page since the reference scrapers turned out to
 be wrong or outdated on some fields (translation_status, release_frequency,
-rating/votes -- see fetch_series()'s docstring). search()'s endpoint is
-confirmed broken and still needs a fix (see its docstring) -- the site's
-real search is JS-driven, not the simple GET the reference scraper used.
+rating/votes -- see fetch_series()'s docstring). search()'s original
+reference-scraper endpoint was confirmed dead and has since been replaced
+with NU's real live-search AJAX endpoint (found by reading the site's own
+`ajax_search_post.js` and confirmed against real queries -- see search()'s
+docstring).
 
 `seleniumbase` and `curl_cffi` are NOT base dependencies (see
 requirements-novelupdates.txt) -- most users of this package (FanMTL scraping
@@ -171,41 +173,58 @@ def solve_challenge_session(url=BASE_URL, max_solve_attempts=4, poll_delay=2.0):
 
 
 def search(session, query, limit=10):
-    """Query NU's own search. Returns up to `limit` hits; each still needs
-    fetch_series() for associated names.
+    """Query Novel Updates' real live-search widget and return up to `limit`
+    deduped hits; each still needs fetch_series() for associated names.
 
-    **CONFIRMED BROKEN as of 2026-08-02, not yet fixed**: the reference
-    scraper's approach (GET / with params s=<query>, post_type=seriesplan)
-    now 404s -- NU's real search form uses post_type=**seriesplans** (plural).
-    Fixing just that typo isn't enough either: a direct GET to that corrected
-    URL gets a *different* Cloudflare block ("Attention Required!", a WAF
-    rule, not the Managed Challenge this module solves for) even from a real
-    solved browser session -- confirmed by testing both a curl_cffi replay
-    AND direct browser navigation to that exact URL. The real search is
-    JS-driven (an autocomplete widget, `delayedSearch()`/`keyenter_search()`
-    handlers on `input[name="s"]`) -- typing into that input via CDP got 90
-    real `/series/` links into the DOM, but not ones matching the typed
-    query, so simulating the interaction isn't right either yet. This needs
-    its own follow-up (most likely: capture the actual AJAX request the
-    autocomplete fires via CDP network logging, rather than another guess).
-    Left in place below since the result-parsing logic itself (once pointed
-    at correct result HTML) is still probably fine -- untested against real
-    result markup either way. `raise_for_status()` means calling this today
-    fails loudly (404/403) rather than silently returning wrong data."""
-    url = f"{BASE_URL}/"
-    r = session.get(url, params={"s": query, "post_type": "seriesplan"}, timeout=20)
+    **Fixed 2026-08-02**, replacing the reference scraper's dead endpoint
+    (GET / with s=<query>&post_type=seriesplan(s) -- 404/403, see git history
+    for that investigation). The real endpoint was found by fetching NU's own
+    `cdn.novelupdates.com/js/ajax_search_post.js` (loaded on every page, no
+    challenge in the way) and reading its `showSearch()` function -- the
+    handler behind the homepage search box's `delayedSearch()` -- directly,
+    then confirmed live against real queries:
+
+        POST {BASE_URL}/wp-admin/admin-ajax.php
+        data={"action": "nd_ajaxsearchmain", "strType": "desktop",
+              "strOne": <query>, "strSearchType": "series"}
+
+    Response is an HTML fragment (`<ul><li class="search_li_results">
+    <a class="a_search" href="...">...</a></li>...</ul>`) with a trailing
+    literal "0" (WordPress admin-ajax's convention for an action that
+    doesn't call wp_die() -- the site's own JS strips it with `.slice(0,
+    -1)` before use; harmless here since we only select() specific tags).
+    No results looks like `<ul></ul><span>No Results found.</span>0`.
+
+    The same series URL can appear in multiple <li>s (once per field that
+    matched -- title vs. an alternate name), each with different link text
+    (sometimes just the matched fragment, e.g. "omniscient reader" rather
+    than the full title) -- confirmed against a real multi-hit response.
+    Deduped by URL below, keeping the longest (most complete) title seen
+    per URL rather than just the first."""
+    r = session.post(f"{BASE_URL}/wp-admin/admin-ajax.php", data={
+        "action": "nd_ajaxsearchmain",
+        "strType": "desktop",
+        "strOne": query,
+        "strSearchType": "series",
+    }, timeout=20)
     r.raise_for_status()
     if looks_like_challenge_page(r.text):
         raise ChallengeExpired(f"Challenge page returned for search {query!r}")
 
     soup = BeautifulSoup(r.text, "html.parser")
-    hits = []
-    for link in soup.select("a.w-blog-entry-link"):
+    order = []
+    best_title = {}
+    for link in soup.select("li.search_li_results a.a_search"):
         href = link.get("href")
-        if not href:
+        title = link.get_text(strip=True)
+        if not href or not title:
             continue
-        title = link.get("title") or link.get_text(strip=True)
-        hits.append(NUSearchHit(title=title, url=urljoin(BASE_URL, href)))
+        href = urljoin(BASE_URL, href)
+        if href not in best_title:
+            order.append(href)
+        if href not in best_title or len(title) > len(best_title[href]):
+            best_title[href] = title
+    hits = [NUSearchHit(title=best_title[href], url=href) for href in order]
     return hits[:limit]
 
 
