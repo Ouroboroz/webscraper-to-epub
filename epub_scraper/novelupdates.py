@@ -70,7 +70,7 @@ def looks_like_challenge_page(html):
     return "<title>Just a moment" in html or "cf_chl_opt" in html
 
 
-def solve_challenge_session(url=BASE_URL, max_solve_attempts=3, poll_delay=2.0):
+def solve_challenge_session(url=BASE_URL, max_solve_attempts=6, poll_delay=2.5):
     """Solve NU's Cloudflare challenge once with a real (SeleniumBase UC Mode)
     browser, then hand back a curl_cffi session (Chrome TLS fingerprint --
     see module docstring for why plain requests doesn't work here) carrying
@@ -83,6 +83,17 @@ def solve_challenge_session(url=BASE_URL, max_solve_attempts=3, poll_delay=2.0):
     from curl_cffi import requests as cf_requests  # local import -- see module docstring
     from seleniumbase import SB  # local import -- see module docstring
 
+    # Deliberately not raising inside the `with SB(...)` block: confirmed by
+    # real-hardware testing that SB(test=True)'s pytest-integration machinery
+    # catches/reports an exception raised inside the block (prints a
+    # "failed" line) but does NOT re-raise it when not actually running under
+    # pytest -- execution then continues past the `with` block as if nothing
+    # happened. So: only ever set local flags/values inside the block, decide
+    # whether to raise after it has closed.
+    solved = False
+    cookies = None
+    user_agent = None
+
     with SB(uc=True, test=True, xvfb=True) as sb:
         sb.uc_open_with_reconnect(url, reconnect_time=4)
         sb.uc_gui_handle_captcha()
@@ -92,14 +103,17 @@ def solve_challenge_session(url=BASE_URL, max_solve_attempts=3, poll_delay=2.0):
         # than trusting it's done after a single call.
         for _ in range(max_solve_attempts):
             if not looks_like_challenge_page(sb.driver.page_source):
+                solved = True
                 break
             time.sleep(poll_delay)
-        else:
-            raise ChallengeExpired(
-                f"Still looked like a challenge page after {max_solve_attempts} checks")
 
-        cookies = sb.driver.get_cookies()
-        user_agent = sb.driver.execute_script("return navigator.userAgent")
+        if solved:
+            cookies = sb.driver.get_cookies()
+            user_agent = sb.driver.execute_script("return navigator.userAgent")
+
+    if not solved:
+        raise ChallengeExpired(
+            f"Still looked like a challenge page after {max_solve_attempts} checks")
 
     session = cf_requests.Session(impersonate="chrome124")
     session.headers["User-Agent"] = user_agent
