@@ -1,5 +1,5 @@
 from epub_scraper import dataspine
-from epub_scraper.dataspine_db import get_novel, init_db
+from epub_scraper.dataspine_db import get_next_page, get_novel, init_db
 from fakes import FakeResponse, FakeSession
 from conftest import load_fixture
 from html_builders import fanmtl_catalog_html, nu_search_html, nu_series_html
@@ -49,6 +49,76 @@ def test_cmd_crawl_respects_pages_limit(monkeypatch, db_path):
 
     conn = init_db(db_path)
     assert get_novel(conn, "fanmtl", f"{BASE_URL}/novel/a1.html") is not None
+
+
+def test_cmd_crawl_resumes_automatically_without_start_page(monkeypatch, db_path, tmp_path):
+    page0 = fanmtl_catalog_html([("Novel A", "a1", 100, "Ongoing")])
+    session0 = FakeSession({page_url(0): FakeResponse(page0, 200, page_url(0))})
+    run_cli(monkeypatch, ["crawl", "--pages", "1", "--pacing-file",
+                          str(tmp_path / "pacing.json"), "--db", db_path], session0)
+
+    # Second run stubs ONLY page 1 -- if it didn't resume automatically and
+    # instead restarted at page 0, FakeSession's strict mode would raise.
+    page1 = fanmtl_catalog_html([("Novel B", "b1", 100, "Ongoing")])
+    session1 = FakeSession({page_url(1): FakeResponse(page1, 200, page_url(1))})
+    run_cli(monkeypatch, ["crawl", "--pages", "1", "--pacing-file",
+                          str(tmp_path / "pacing.json"), "--db", db_path], session1)
+
+    conn = init_db(db_path)
+    assert get_novel(conn, "fanmtl", f"{BASE_URL}/novel/a1.html") is not None
+    assert get_novel(conn, "fanmtl", f"{BASE_URL}/novel/b1.html") is not None
+
+
+def test_cmd_crawl_start_page_overrides_persisted_resume_point(monkeypatch, db_path, tmp_path):
+    page0 = fanmtl_catalog_html([("Novel A", "a1", 100, "Ongoing")])
+    session0 = FakeSession({page_url(0): FakeResponse(page0, 200, page_url(0))})
+    run_cli(monkeypatch, ["crawl", "--pages", "1", "--pacing-file",
+                          str(tmp_path / "pacing.json"), "--db", db_path], session0)
+
+    # Explicit --start-page 0 overrides the persisted resume point (which is
+    # now 1) -- refetches page 0 instead of continuing at page 1.
+    page0_again = fanmtl_catalog_html([("Novel A", "a1", 100, "Ongoing"),
+                                        ("Novel C", "c1", 100, "Ongoing")])
+    session1 = FakeSession({page_url(0): FakeResponse(page0_again, 200, page_url(0))})
+    run_cli(monkeypatch, ["crawl", "--start-page", "0", "--pages", "1", "--refresh",
+                          "--pacing-file", str(tmp_path / "pacing.json"), "--db", db_path],
+            session1)
+
+    conn = init_db(db_path)
+    assert get_novel(conn, "fanmtl", f"{BASE_URL}/novel/c1.html") is not None
+
+
+def test_cmd_crawl_retries_transient_failure_then_succeeds(monkeypatch, db_path, tmp_path):
+    monkeypatch.setattr(dataspine.time, "sleep", lambda secs: None)
+    page0 = fanmtl_catalog_html([("Novel A", "a1", 100, "Ongoing")])
+    attempts = {"n": 0}
+
+    def flaky_page0():
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return RuntimeError("connection reset")
+        return FakeResponse(page0, 200, page_url(0))
+
+    session = FakeSession({page_url(0): flaky_page0,
+                           page_url(1): FakeResponse(fanmtl_catalog_html([]), 200, page_url(1))})
+    run_cli(monkeypatch, ["crawl", "--pacing-file", str(tmp_path / "pacing.json"),
+                          "--db", db_path], session)
+
+    assert attempts["n"] == 2  # one failure, one successful retry
+    conn = init_db(db_path)
+    assert get_novel(conn, "fanmtl", f"{BASE_URL}/novel/a1.html") is not None
+
+
+def test_cmd_crawl_gives_up_after_max_retries_and_persists_resume_point(
+        monkeypatch, db_path, tmp_path, capsys):
+    monkeypatch.setattr(dataspine.time, "sleep", lambda secs: None)
+    session = FakeSession({page_url(0): RuntimeError("always fails")})
+    run_cli(monkeypatch, ["crawl", "--pacing-file", str(tmp_path / "pacing.json"),
+                          "--db", db_path], session)
+
+    assert "giving up after" in capsys.readouterr().out
+    conn = init_db(db_path)
+    assert get_next_page(conn, "fanmtl") == 0  # resumes at the same failed page next time
 
 
 def test_cmd_metadata_fills_in_synopsis_for_pending_candidate(monkeypatch, db_path):

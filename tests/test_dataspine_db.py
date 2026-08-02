@@ -1,9 +1,10 @@
 import pytest
 
-from epub_scraper.dataspine_db import (get_novel, init_db, iter_candidates_missing_metadata,
+from epub_scraper.dataspine_db import (get_next_page, get_novel, init_db,
+                                        iter_candidates_missing_metadata,
                                         iter_candidates_missing_nu_resolution,
-                                        recompute_candidates, stats, upsert_catalog_entry,
-                                        upsert_metadata, upsert_nu_metadata)
+                                        recompute_candidates, set_next_page, stats,
+                                        upsert_catalog_entry, upsert_metadata, upsert_nu_metadata)
 from epub_scraper.novelupdates import NUSeriesMetadata
 from epub_scraper.profile import CatalogEntry, MetadataResult
 
@@ -206,6 +207,38 @@ def test_upsert_nu_metadata_raises_for_unknown_novel(db_path):
     conn = init_db(db_path)
     with pytest.raises(ValueError):
         upsert_nu_metadata(conn, "fanmtl", "https://x/novel/missing.html", "no_candidates")
+
+
+# -- crawl resume checkpoint ---------------------------------------------------
+
+def test_get_next_page_defaults_to_zero_for_unseen_site(db_path):
+    conn = init_db(db_path)
+    assert get_next_page(conn, "fanmtl") == 0
+
+
+def test_set_next_page_then_get_roundtrips(db_path):
+    conn = init_db(db_path)
+    set_next_page(conn, "fanmtl", 7)
+    conn.commit()
+    assert get_next_page(conn, "fanmtl") == 7
+
+
+def test_set_next_page_upserts_not_duplicates(db_path):
+    conn = init_db(db_path)
+    set_next_page(conn, "fanmtl", 3)
+    conn.commit()
+    set_next_page(conn, "fanmtl", 9)
+    conn.commit()
+    assert get_next_page(conn, "fanmtl") == 9
+    assert conn.execute("SELECT COUNT(*) FROM crawl_state").fetchone()[0] == 1
+
+
+def test_set_next_page_is_per_site(db_path):
+    conn = init_db(db_path)
+    set_next_page(conn, "fanmtl", 5)
+    conn.commit()
+    assert get_next_page(conn, "other_site") == 0
+    assert get_next_page(conn, "fanmtl") == 5
 
 
 def test_stats_includes_nu_resolution_breakdown(db_path):
