@@ -1,3 +1,4 @@
+import json
 import os
 
 import pytest
@@ -91,3 +92,20 @@ def test_main_no_cache_flag_forces_fresh_fetch_despite_existing_cache(monkeypatc
     assert len(session.calls) == 2  # index GET + chapter 1 GET (cache bypassed)
     assert cache.load_cached(cache_dir, CHAPTER_ID, 1) == chapter_page(1)
     assert os.path.exists(out)
+
+
+def test_main_pacing_file_flag_persists_widened_interval_on_429(monkeypatch, tmp_path):
+    pacing_file = str(tmp_path / "custom_pacing.json")
+    session = FakeSession({
+        INDEX_URL: FakeResponse(index_page(total=1), 200, INDEX_URL),
+        chapter_url(1): FakeResponse("", 429, chapter_url(1), headers={"Retry-After": "20"}),
+    })
+
+    with pytest.raises(SystemExit):  # no chapters fetched (only one, and it 429s) -> exits 1
+        run_cli(monkeypatch,
+                [INDEX_URL, "--cache-dir", str(tmp_path / ".cache"), "--pacing-file", pacing_file],
+                session)
+
+    with open(pacing_file, encoding="utf-8") as f:
+        data = json.load(f)
+    assert data["fanmtl"] == 20.0
