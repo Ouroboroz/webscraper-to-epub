@@ -20,12 +20,15 @@ def test_looks_like_challenge_page_false_for_real_content():
 
 # -- search ---------------------------------------------------------------------
 
+AJAX_URL = f"{BASE_URL}/wp-admin/admin-ajax.php"
+
+
 def test_search_parses_hits():
     html = nu_search_html([
         ("Reverend Insanity", "https://www.novelupdates.com/series/reverend-insanity/"),
         ("Some Other Novel", "https://www.novelupdates.com/series/some-other/"),
     ])
-    session = FakeSession({f"{BASE_URL}/": FakeResponse(html, 200, f"{BASE_URL}/")})
+    session = FakeSession({AJAX_URL: FakeResponse(html, 200, AJAX_URL)})
 
     hits = search(session, "reverend insanity")
 
@@ -34,20 +37,73 @@ def test_search_parses_hits():
         NUSearchHit("Some Other Novel", "https://www.novelupdates.com/series/some-other/"),
     ]
     method, url, kwargs = session.calls[0]
-    assert method == "GET"
-    assert kwargs["params"] == {"s": "reverend insanity", "post_type": "seriesplan"}
+    assert method == "POST"
+    assert kwargs["data"] == {
+        "action": "nd_ajaxsearchmain", "strType": "desktop",
+        "strOne": "reverend insanity", "strSearchType": "series",
+    }
+
+
+def test_search_dedupes_by_url_keeping_longest_title():
+    # Confirmed against a real multi-hit response (2026-08-02): the same
+    # series URL can appear more than once, with shorter/partial link text
+    # on some entries -- e.g. matching just an alternate name fragment.
+    html = nu_search_html([
+        ("omniscient reader", "https://www.novelupdates.com/series/orv/"),
+        ("Omniscient Reader's Viewpoint", "https://www.novelupdates.com/series/orv/"),
+    ])
+    session = FakeSession({AJAX_URL: FakeResponse(html, 200, AJAX_URL)})
+
+    hits = search(session, "omniscient reader")
+
+    assert hits == [NUSearchHit("Omniscient Reader's Viewpoint",
+                                 "https://www.novelupdates.com/series/orv/")]
+
+
+def test_search_no_results_real_fixture():
+    html = load_fixture("novelupdates_search_no_results.html")
+    session = FakeSession({AJAX_URL: FakeResponse(html, 200, AJAX_URL)})
+    assert search(session, "zzzznoresultxyz123") == []
+
+
+def test_search_real_fixture_reverend_insanity():
+    # Captured 2026-08-02 via a real solved session against the live
+    # nd_ajaxsearchmain endpoint (see search()'s docstring).
+    html = load_fixture("novelupdates_search_reverend_insanity.html")
+    session = FakeSession({AJAX_URL: FakeResponse(html, 200, AJAX_URL)})
+
+    hits = search(session, "reverend insanity")
+
+    assert hits == [NUSearchHit("reverend insanity",
+                                 "https://www.novelupdates.com/series/reverend-insanity/")]
+
+
+def test_search_real_fixture_omniscient_reader_multi_hit_dedupe():
+    # Captured 2026-08-02: a query matching several series/alt-names,
+    # including duplicate <li>s for the same URL with shorter link text.
+    html = load_fixture("novelupdates_search_omniscient_reader.html")
+    session = FakeSession({AJAX_URL: FakeResponse(html, 200, AJAX_URL)})
+
+    hits = search(session, "omniscient reader")
+
+    assert hits == [
+        NUSearchHit("omniscient reader's Viewpoint",
+                    "https://www.novelupdates.com/series/omniscient-readers-viewpoint/"),
+        NUSearchHit("omniscient reader's Viewpoint – Side Story",
+                    "https://www.novelupdates.com/series/omniscient-readers-viewpoint-side-story/"),
+    ]
 
 
 def test_search_respects_limit():
     html = nu_search_html([(f"Novel {i}", f"https://www.novelupdates.com/series/n{i}/")
                             for i in range(5)])
-    session = FakeSession({f"{BASE_URL}/": FakeResponse(html, 200, f"{BASE_URL}/")})
+    session = FakeSession({AJAX_URL: FakeResponse(html, 200, AJAX_URL)})
     assert len(search(session, "novel", limit=2)) == 2
 
 
 def test_search_raises_challenge_expired_when_blocked():
     html = load_fixture("novelupdates_cloudflare_challenge.html")
-    session = FakeSession({f"{BASE_URL}/": FakeResponse(html, 200, f"{BASE_URL}/")})
+    session = FakeSession({AJAX_URL: FakeResponse(html, 200, AJAX_URL)})
     with pytest.raises(ChallengeExpired):
         search(session, "anything")
 

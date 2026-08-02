@@ -26,13 +26,14 @@ def fanmtl_index_html_no_links(title="Test Novel"):
 
 
 def nu_search_html(hits):
-    """hits: list of (title, url) tuples -> a Novel Updates search-results
-    page shaped to match novelupdates.search()'s selector (a.w-blog-entry-link)."""
+    """hits: list of (title, url) tuples -> a Novel Updates live-search AJAX
+    response shaped to match novelupdates.search()'s selector
+    (li.search_li_results a.a_search), trailing literal "0" and all --
+    confirmed against a real captured response (2026-08-02)."""
     items = "".join(
-        f'<div class="w-blog-entry"><a class="w-blog-entry-link" href="{url}" '
-        f'title="{title}">{title}</a></div>'
+        f'<li class="search_li_results"><a class="a_search" href="{url}">{title}</a></li>'
         for title, url in hits)
-    return f"<html><body>{items}</body></html>"
+    return f"<ul>{items}</ul>0"
 
 
 def nu_series_html(*, title="Test Series", associated_names=None, genres=None, tags=None,
