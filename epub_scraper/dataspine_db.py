@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS novel_tags (
     tag_id INTEGER NOT NULL REFERENCES tags(id),
     PRIMARY KEY (novel_id, tag_id)
 );
+
+CREATE TABLE IF NOT EXISTS crawl_state (
+    site_key TEXT PRIMARY KEY,
+    next_page INTEGER NOT NULL DEFAULT 0,
+    last_crawled_at TEXT
+);
 """
 
 
@@ -104,6 +110,30 @@ def upsert_catalog_entry(conn, entry, *, site_key):
             "updated_text": entry.updated_text,
             "now": now,
         },
+    )
+
+
+def get_next_page(conn, site_key):
+    """The page `crawl` should resume from when --start-page isn't given
+    explicitly -- 0 if this site has never been crawled before."""
+    row = conn.execute(
+        "SELECT next_page FROM crawl_state WHERE site_key = ?", (site_key,)
+    ).fetchone()
+    return row["next_page"] if row is not None else 0
+
+
+def set_next_page(conn, site_key, next_page):
+    """Persist the resume point after every page (successful or not), so a
+    killed/interrupted crawl picks back up on its own on the next run instead
+    of relying on the operator to notice and pass back --start-page."""
+    conn.execute(
+        """
+        INSERT INTO crawl_state (site_key, next_page, last_crawled_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(site_key) DO UPDATE SET
+            next_page=excluded.next_page, last_crawled_at=excluded.last_crawled_at
+        """,
+        (site_key, next_page, now_iso()),
     )
 
 
