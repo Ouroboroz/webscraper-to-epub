@@ -1,3 +1,4 @@
+import json
 import os
 
 import pytest
@@ -91,3 +92,66 @@ def test_main_no_cache_flag_forces_fresh_fetch_despite_existing_cache(monkeypatc
     assert len(session.calls) == 2  # index GET + chapter 1 GET (cache bypassed)
     assert cache.load_cached(cache_dir, CHAPTER_ID, 1) == chapter_page(1)
     assert os.path.exists(out)
+
+
+def test_main_index_429_widens_persisted_pacing_interval(monkeypatch, tmp_path):
+    # The index page is the first and most exposed request of a run; a block
+    # here has to feed the same learned backoff as a block mid-chapter.
+    pacing_file = str(tmp_path / "custom_pacing.json")
+    session = FakeSession({INDEX_URL: FakeResponse("", 429, INDEX_URL,
+                                                    headers={"Retry-After": "40"})})
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_cli(monkeypatch,
+                [INDEX_URL, "--cache-dir", str(tmp_path / ".cache"), "--pacing-file", pacing_file],
+                session)
+
+    assert exc_info.value.code == 1  # user-facing exit behavior unchanged
+    with open(pacing_file, encoding="utf-8") as f:
+        assert json.load(f)["fanmtl"] == 40.0
+
+
+def test_main_index_challenge_page_widens_persisted_pacing_interval(monkeypatch, tmp_path):
+    pacing_file = str(tmp_path / "custom_pacing.json")
+    body = ("<html><head><title>Just a moment...</title></head>"
+            "<body>Checking your browser</body></html>")
+    session = FakeSession({INDEX_URL: FakeResponse(body, 200, INDEX_URL)})
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_cli(monkeypatch,
+                [INDEX_URL, "--cache-dir", str(tmp_path / ".cache"), "--pacing-file", pacing_file],
+                session)
+
+    assert exc_info.value.code == 1
+    with open(pacing_file, encoding="utf-8") as f:
+        assert json.load(f)["fanmtl"] == 5.0  # default 2.5 * BACKOFF_FACTOR
+
+
+def test_main_index_500_does_not_widen_pacing_interval(monkeypatch, tmp_path):
+    # Only a 429 or a challenge page is the site pushing back; a plain 500 isn't.
+    pacing_file = str(tmp_path / "custom_pacing.json")
+    session = FakeSession({INDEX_URL: FakeResponse("", 500, INDEX_URL)})
+
+    with pytest.raises(SystemExit):
+        run_cli(monkeypatch,
+                [INDEX_URL, "--cache-dir", str(tmp_path / ".cache"), "--pacing-file", pacing_file],
+                session)
+
+    assert not os.path.exists(pacing_file)
+
+
+def test_main_pacing_file_flag_persists_widened_interval_on_429(monkeypatch, tmp_path):
+    pacing_file = str(tmp_path / "custom_pacing.json")
+    session = FakeSession({
+        INDEX_URL: FakeResponse(index_page(total=1), 200, INDEX_URL),
+        chapter_url(1): FakeResponse("", 429, chapter_url(1), headers={"Retry-After": "20"}),
+    })
+
+    with pytest.raises(SystemExit):  # no chapters fetched (only one, and it 429s) -> exits 1
+        run_cli(monkeypatch,
+                [INDEX_URL, "--cache-dir", str(tmp_path / ".cache"), "--pacing-file", pacing_file],
+                session)
+
+    with open(pacing_file, encoding="utf-8") as f:
+        data = json.load(f)
+    assert data["fanmtl"] == 20.0

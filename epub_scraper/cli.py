@@ -8,6 +8,7 @@ Options:
   --start N       First chapter (default: 1)
   --end N         Last chapter inclusive (default: auto-detect)
   --delay N       Seconds between requests (default: 2.5)
+  --pacing-file FILE  Where to persist learned per-site pacing (default: pacing.json)
   --output FILE   Output filename (default: auto from title)
   --site KEY      Force a specific site profile (default: auto-detect from URL domain)
 
@@ -27,7 +28,8 @@ import requests
 
 from . import engine
 from .epub_writer import build_epub
-from .fetcher import HEADERS, fetch
+from .fetcher import HEADERS, fetch, note_throttle
+from .pacing import DEFAULT_PACING_PATH, Pacer
 from .scrape import scrape_chapters
 from .sites import PROFILES, resolve_profile
 from .util import epub_path, get_base_url
@@ -54,6 +56,8 @@ def main():
                         help="Ignore and overwrite any existing cache")
     parser.add_argument("--site", choices=sorted(PROFILES), default=None, metavar="KEY",
                         help="Force a specific site profile (default: auto-detect from URL domain)")
+    parser.add_argument("--pacing-file", default=DEFAULT_PACING_PATH, metavar="FILE",
+                        help="Where to persist learned per-site request pacing (default: pacing.json)")
     args = parser.parse_args()
 
     profile = resolve_profile(args.url, args.site)
@@ -62,11 +66,16 @@ def main():
     session.headers.update(HEADERS)
     session.headers["Referer"] = get_base_url(args.url)
 
+    pacer = Pacer.load(args.pacing_file, default_interval=args.delay)
+
     # -- Index ----------------------------------------------------------------
     print(f"Fetching index: {args.url}")
     try:
         index_html = fetch(args.url, session)
     except Exception as e:
+        # The index page is the first and most exposed request of the run, so a
+        # block here is the most likely place to learn a site's real limit.
+        note_throttle(pacer, profile.site_key, e)
         print(f"Error fetching index: {e}")
         sys.exit(1)
 
@@ -107,7 +116,7 @@ def main():
     chapters, failed_ns, _ = scrape_chapters(
         profile, session, base_url, chapter_id, chapter_range,
         cache_dir=args.cache_dir, no_cache=args.no_cache,
-        delay=args.delay, progress_cb=_progress)
+        delay=args.delay, pacer=pacer, progress_cb=_progress)
     skipped = len(failed_ns)
 
     print("-" * 56)

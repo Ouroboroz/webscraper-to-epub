@@ -16,6 +16,36 @@ def _escape_xhtml(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+_HIDDEN_STYLE_MARKERS = ("display:none", "visibility:hidden")
+# Anchored so "opacity:0" doesn't prefix-match "opacity:0.85" -- a perfectly
+# visible link. Dropping a legitimate chapter link is the expensive direction
+# of a false positive here, since it happens silently.
+_HIDDEN_OPACITY_RE = re.compile(r"opacity:0(\.0+)?(;|$)")
+
+
+def _is_safe_link(a):
+    rel = a.get("rel") or []
+    if isinstance(rel, str):
+        rel = rel.split()
+    # HTML link types are ASCII case-insensitive per spec: rel="NoFollow" counts.
+    if any(r.lower() == "nofollow" for r in rel):
+        return False
+    if a.has_attr("hidden"):
+        return False
+    if (a.get("aria-hidden") or "").strip().lower() == "true":
+        return False
+    style = (a.get("style") or "").lower().replace(" ", "")
+    if any(marker in style for marker in _HIDDEN_STYLE_MARKERS):
+        return False
+    if _HIDDEN_OPACITY_RE.search(style):
+        return False
+    return True
+
+
+def _safe_anchors(soup):
+    return [a for a in soup.find_all("a", href=True) if _is_safe_link(a)]
+
+
 def parse_index(profile, html, url):
     """Return an IndexResult for the novel's index page."""
     if profile.parse_index_fn is not None:
@@ -36,7 +66,7 @@ def parse_index(profile, html, url):
 
     # Extract slug/id from chapter links
     chapter_id = None
-    for a in soup.find_all("a", href=True):
+    for a in _safe_anchors(soup):
         m = re.search(profile.chapter_link_pattern, a["href"])
         if m:
             chapter_id = m.group(1)
@@ -51,7 +81,7 @@ def parse_index(profile, html, url):
     # Fallback total: scan all chapter hrefs for the highest number
     if total is None:
         nums = []
-        for a in soup.find_all("a", href=True):
+        for a in _safe_anchors(soup):
             m = re.search(profile.chapter_number_fallback_pattern, a["href"])
             if m:
                 nums.append(int(m.group(1)))
