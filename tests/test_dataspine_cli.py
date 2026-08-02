@@ -1,8 +1,9 @@
 from epub_scraper import dataspine
-from epub_scraper.dataspine_db import get_next_page, get_novel, init_db
+from epub_scraper.dataspine_db import (get_next_page, get_novel, init_db,
+                                        iter_candidates_missing_chapters)
 from fakes import FakeResponse, FakeSession
 from conftest import load_fixture
-from html_builders import fanmtl_catalog_html, nu_search_html, nu_series_html
+from html_builders import fanmtl_catalog_html, fanmtl_chapter_html, nu_search_html, nu_series_html
 
 NU_BASE_URL = "https://www.novelupdates.com"
 NU_AJAX_URL = f"{NU_BASE_URL}/wp-admin/admin-ajax.php"
@@ -232,6 +233,65 @@ def test_cmd_enrich_resolves_session_expiry_mid_run(monkeypatch, db_path):
 def test_cmd_enrich_no_pending_candidates_prints_message(monkeypatch, db_path, capsys):
     run_cli(monkeypatch, ["enrich", "--db", db_path], FakeSession({}))
     assert "No candidates pending Novel Updates enrichment" in capsys.readouterr().out
+
+
+def chapter_url(chapter_id, n):
+    return f"{BASE_URL}/novel/{chapter_id}_{n}.html"
+
+
+def test_cmd_chapters_samples_and_stores_plain_text(monkeypatch, db_path, tmp_path):
+    _crawl_one(monkeypatch, db_path, "ri1", title="Reverend Insanity")
+
+    session = FakeSession({
+        chapter_url("ri1", n): FakeResponse(
+            fanmtl_chapter_html([f"Real prose for chapter {n}, long enough to keep."],
+                                 title=f"Chapter {n}"),
+            200, chapter_url("ri1", n))
+        for n in range(1, 6)
+    })
+    run_cli(monkeypatch, ["chapters", "--count", "5", "--cache-dir", str(tmp_path / ".cache"),
+                          "--db", db_path], session)
+
+    conn = init_db(db_path)
+    novel = get_novel(conn, "fanmtl", f"{BASE_URL}/novel/ri1.html")
+    assert novel["chapters_sampled_at"] is not None
+    rows = conn.execute(
+        "SELECT * FROM chapters WHERE novel_id = ? ORDER BY chapter_number", (novel["id"],)
+    ).fetchall()
+    assert [r["chapter_number"] for r in rows] == [1, 2, 3, 4, 5]
+    assert rows[0]["title"] == "Chapter 1"
+    assert rows[0]["body"] == "Real prose for chapter 1, long enough to keep."
+    assert "<p>" not in rows[0]["body"]  # stored as clean plain text, not markup
+
+
+def test_cmd_chapters_partial_failure_still_marks_processed(monkeypatch, db_path, tmp_path):
+    _crawl_one(monkeypatch, db_path, "ri1", title="Reverend Insanity")
+
+    responses = {
+        chapter_url("ri1", n): FakeResponse(
+            fanmtl_chapter_html([f"Real prose for chapter {n}, long enough to keep."],
+                                 title=f"Chapter {n}"),
+            200, chapter_url("ri1", n))
+        for n in [1, 2, 4, 5]  # chapter 3 missing entirely -> a hard failure
+    }
+    responses[chapter_url("ri1", 3)] = FakeResponse("", 404, chapter_url("ri1", 3))
+    session = FakeSession(responses)
+    run_cli(monkeypatch, ["chapters", "--count", "5", "--cache-dir", str(tmp_path / ".cache"),
+                          "--db", db_path], session)
+
+    conn = init_db(db_path)
+    novel = get_novel(conn, "fanmtl", f"{BASE_URL}/novel/ri1.html")
+    assert novel["chapters_sampled_at"] is not None
+    rows = conn.execute("SELECT chapter_number FROM chapters WHERE novel_id = ?",
+                         (novel["id"],)).fetchall()
+    assert {r["chapter_number"] for r in rows} == {1, 2, 4, 5}
+    # Marked processed despite the gap -- must not be retried forever.
+    assert iter_candidates_missing_chapters(conn, "fanmtl") == []
+
+
+def test_cmd_chapters_no_pending_candidates_prints_message(monkeypatch, db_path, capsys):
+    run_cli(monkeypatch, ["chapters", "--db", db_path], FakeSession({}))
+    assert "No candidates pending a chapter sample" in capsys.readouterr().out
 
 
 def test_cmd_stats_prints_summary(monkeypatch, db_path, capsys):

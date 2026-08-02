@@ -1,10 +1,12 @@
 import pytest
 
 from epub_scraper.dataspine_db import (get_next_page, get_novel, init_db,
+                                        iter_candidates_missing_chapters,
                                         iter_candidates_missing_metadata,
                                         iter_candidates_missing_nu_resolution,
                                         recompute_candidates, set_next_page, stats,
-                                        upsert_catalog_entry, upsert_metadata, upsert_nu_metadata)
+                                        upsert_catalog_entry, upsert_chapters, upsert_metadata,
+                                        upsert_nu_metadata)
 from epub_scraper.novelupdates import NUSeriesMetadata
 from epub_scraper.profile import CatalogEntry, MetadataResult
 
@@ -239,6 +241,92 @@ def test_set_next_page_is_per_site(db_path):
     conn.commit()
     assert get_next_page(conn, "other_site") == 0
     assert get_next_page(conn, "fanmtl") == 5
+
+
+# -- chapter sampling -----------------------------------------------------------
+
+def test_iter_candidates_missing_chapters_excludes_sampled(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    upsert_catalog_entry(conn, make_entry("https://x/novel/b.html", 100, title="B"), site_key="fanmtl")
+    conn.commit()
+    recompute_candidates(conn, min_chapters=80, site_key="fanmtl")
+    conn.commit()
+
+    pending = iter_candidates_missing_chapters(conn, "fanmtl")
+    assert {row["title"] for row in pending} == {"A", "B"}
+
+    novel_a = get_novel(conn, "fanmtl", "https://x/novel/a.html")
+    upsert_chapters(conn, novel_a["id"], [(1, "Chapter 1", "Some prose.")])
+    conn.commit()
+
+    pending = iter_candidates_missing_chapters(conn, "fanmtl")
+    assert [row["title"] for row in pending] == ["B"]
+
+
+def test_upsert_chapters_stores_rows_and_stamps_sampled_at(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    conn.commit()
+    novel = get_novel(conn, "fanmtl", "https://x/novel/a.html")
+
+    upsert_chapters(conn, novel["id"], [
+        (1, "Chapter 1", "First chapter prose."),
+        (2, "Chapter 2", "Second chapter prose."),
+    ])
+    conn.commit()
+
+    rows = conn.execute(
+        "SELECT * FROM chapters WHERE novel_id = ? ORDER BY chapter_number", (novel["id"],)
+    ).fetchall()
+    assert [r["title"] for r in rows] == ["Chapter 1", "Chapter 2"]
+    assert [r["body"] for r in rows] == ["First chapter prose.", "Second chapter prose."]
+    assert get_novel(conn, "fanmtl", "https://x/novel/a.html")["chapters_sampled_at"] is not None
+
+
+def test_upsert_chapters_stamps_sampled_at_even_with_partial_results(db_path):
+    # A novel that only yields 1/5 chapters (others 404/decoy out) must still
+    # be marked processed -- otherwise it'd be retried forever.
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    conn.commit()
+    novel = get_novel(conn, "fanmtl", "https://x/novel/a.html")
+
+    upsert_chapters(conn, novel["id"], [(1, "Chapter 1", "Only this one landed.")])
+    conn.commit()
+
+    assert get_novel(conn, "fanmtl", "https://x/novel/a.html")["chapters_sampled_at"] is not None
+    assert iter_candidates_missing_chapters(conn, "fanmtl") == []
+
+
+def test_upsert_chapters_is_idempotent_upsert(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    conn.commit()
+    novel = get_novel(conn, "fanmtl", "https://x/novel/a.html")
+
+    upsert_chapters(conn, novel["id"], [(1, "Chapter 1", "Old text.")])
+    conn.commit()
+    upsert_chapters(conn, novel["id"], [(1, "Chapter 1", "New text.")])
+    conn.commit()
+
+    rows = conn.execute("SELECT * FROM chapters WHERE novel_id = ?", (novel["id"],)).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["body"] == "New text."
+
+
+def test_stats_includes_chapters_progress(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    conn.commit()
+    recompute_candidates(conn, min_chapters=80, site_key="fanmtl")
+    conn.commit()
+    novel = get_novel(conn, "fanmtl", "https://x/novel/a.html")
+    upsert_chapters(conn, novel["id"], [(1, "Chapter 1", "Prose.")])
+    conn.commit()
+
+    summary = stats(conn, site_key="fanmtl")
+    assert summary["candidates_with_chapters"] == 1
 
 
 def test_stats_includes_nu_resolution_breakdown(db_path):

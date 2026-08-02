@@ -11,6 +11,8 @@ Usage:
                                              [--pacing-file FILE] [--db FILE]
   python -m epub_scraper.dataspine enrich [--limit N] [--search-candidates N]
                                            [--delay SECS] [--pacing-file FILE] [--db FILE]
+  python -m epub_scraper.dataspine chapters [--count N] [--limit N] [--delay SECS]
+                                             [--pacing-file FILE] [--db FILE]
   python -m epub_scraper.dataspine stats [--db FILE]
 
 `crawl` paginates the catalog browse listing (30 novels/page, thousands of
@@ -23,7 +25,14 @@ only to override that. `metadata` then fetches the full index page for each
 candidate still missing a synopsis (i.e. not yet processed), so it's safe to
 re-run repeatedly as the candidate set grows. `enrich` resolves candidates
 against Novel Updates (requires requirements-novelupdates.txt -- see that
-file and epub_scraper/novelupdates.py's docstring).
+file and epub_scraper/novelupdates.py's docstring). `chapters` samples the
+first --count chapters (default 5 -- most novels can be judged on their
+opening) of each candidate's actual prose, for signal synopsis/tags/metadata
+alone can't capture (pacing, prose quality, whether the hook lands) --
+reuses epub_scraper.scrape.scrape_chapters() (the same engine the interactive
+EPUB-download pipeline uses, including its on-disk .cache/, so a chapter
+sampled here is already warm if the novel later gets a full download)
+instead of a second chapter fetcher.
 
 All three long-running commands share the same Pacer (epub_scraper.pacing --
 originally built for the chapter scraper) via --pacing-file: a persisted,
@@ -41,19 +50,23 @@ import argparse
 import time
 
 import requests
+from bs4 import BeautifulSoup
 
 from . import entity_resolution, novelupdates
 from .dataspine_db import (DEFAULT_DB_PATH, get_next_page, get_novel, init_db,
-                            iter_candidates_missing_metadata,
+                            iter_candidates_missing_chapters, iter_candidates_missing_metadata,
                             iter_candidates_missing_nu_resolution, recompute_candidates,
-                            set_next_page, stats, upsert_catalog_entry, upsert_metadata,
-                            upsert_nu_metadata)
+                            set_next_page, stats, upsert_catalog_entry, upsert_chapters,
+                            upsert_metadata, upsert_nu_metadata)
 from .fetcher import HEADERS, fetch, note_throttle
 from .pacing import DEFAULT_PACING_PATH, Pacer
-from .sites.fanmtl import CATALOG_URL_TEMPLATE, parse_fanmtl_catalog_page, parse_fanmtl_metadata
+from .scrape import scrape_chapters
+from .sites.fanmtl import BASE_URL as FANMTL_BASE_URL
+from .sites.fanmtl import CATALOG_URL_TEMPLATE, PROFILE, parse_fanmtl_catalog_page, parse_fanmtl_metadata
 
 SITE_KEY = "fanmtl"
 NU_SITE_KEY = "novelupdates"
+DEFAULT_CHAPTER_SAMPLE_SIZE = 5
 # Bounded re-solves per `enrich` run if the Cloudflare session expires
 # mid-run -- protects against looping forever if solving itself is broken.
 MAX_CHALLENGE_RESOLVES = 2
@@ -246,12 +259,56 @@ def cmd_enrich(args):
             time.sleep(pacer.gap(NU_SITE_KEY))
 
 
+def _plain_text_from_chapter_body(body_html):
+    """scrape_chapters() returns each chapter's body as XHTML-escaped
+    '<p>...</p>' fragments (meant for splicing straight into an EPUB) -- undo
+    that here so what lands in the DB is clean prose, not markup, for
+    whatever reads it next (embeddings, a labeling-review UI, an LLM)."""
+    paragraphs = [p.get_text() for p in BeautifulSoup(body_html, "html.parser").find_all("p")]
+    return "\n\n".join(paragraphs)
+
+
+def cmd_chapters(args):
+    conn = init_db(args.db)
+    session = _session()
+    pacer = Pacer.load(args.pacing_file, default_interval=args.delay)
+
+    rows = iter_candidates_missing_chapters(conn, SITE_KEY, limit=args.limit)
+    if not rows:
+        print("No candidates pending a chapter sample.")
+        return
+
+    chapter_range = range(1, args.count + 1)
+    started_at = time.monotonic()
+    for i, row in enumerate(rows):
+        try:
+            fetched, failed_ns, _ = scrape_chapters(
+                PROFILE, session, FANMTL_BASE_URL, row["chapter_id"], chapter_range,
+                cache_dir=args.cache_dir, delay=args.delay, pacer=pacer)
+            successful_ns = [n for n in chapter_range if n not in failed_ns]
+            upsert_chapters(conn, row["id"], [
+                (n, title, _plain_text_from_chapter_body(body))
+                for n, (title, body) in zip(successful_ns, fetched)
+            ])
+            conn.commit()
+            elapsed = time.monotonic() - started_at
+            print(f"[{i + 1}/{len(rows)}] {row['title']!r}  "
+                  f"({len(fetched)}/{args.count} chapters, {elapsed / 60:.1f}m elapsed)")
+        except Exception as e:
+            note_throttle(pacer, SITE_KEY, e)
+            print(f"[{i + 1}/{len(rows)}] error on {row['title']!r}: {e}")
+
+        if i < len(rows) - 1:
+            time.sleep(pacer.gap(SITE_KEY))
+
+
 def cmd_stats(args):
     conn = init_db(args.db)
     summary = stats(conn, site_key=SITE_KEY)
     print(f"Total catalogued : {summary['total']}")
     print(f"Candidates       : {summary['candidates']}")
     print(f"  with metadata  : {summary['candidates_with_metadata']}")
+    print(f"  with chapters  : {summary['candidates_with_chapters']}")
     print("  by status:")
     for status, count in sorted(summary["candidates_by_status"].items(),
                                  key=lambda kv: -kv[1]):
@@ -300,6 +357,20 @@ def build_parser():
     p_enrich.add_argument("--pacing-file", default=DEFAULT_PACING_PATH, metavar="FILE")
     p_enrich.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
     p_enrich.set_defaults(func=cmd_enrich)
+
+    p_chapters = sub.add_parser("chapters", help="Sample each candidate's first N chapters")
+    p_chapters.add_argument("--count", type=int, default=DEFAULT_CHAPTER_SAMPLE_SIZE, metavar="N",
+                             help=f"Chapters to sample per novel (default: "
+                                  f"{DEFAULT_CHAPTER_SAMPLE_SIZE})")
+    p_chapters.add_argument("--limit", type=int, default=20, metavar="N")
+    p_chapters.add_argument("--delay", type=float, default=2.5, metavar="SECS")
+    p_chapters.add_argument("--pacing-file", default=DEFAULT_PACING_PATH, metavar="FILE")
+    p_chapters.add_argument("--cache-dir", default=".cache", metavar="DIR",
+                             help="Shared with the interactive EPUB-download pipeline's chapter "
+                                  "cache (default: .cache) -- a sampled chapter is already warm "
+                                  "if the novel later gets a full download")
+    p_chapters.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
+    p_chapters.set_defaults(func=cmd_chapters)
 
     p_stats = sub.add_parser("stats", help="Show crawl/candidate progress")
     p_stats.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
