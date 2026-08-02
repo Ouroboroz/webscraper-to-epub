@@ -11,17 +11,28 @@ Classification Data Spine vault story. Treat mismatches as "the live site
 doesn't match those scrapers anymore," not as a logic bug here, until proven
 otherwise by running `python -m epub_scraper.novelupdates check` for real.
 
-`seleniumbase` is NOT a base dependency (see requirements-novelupdates.txt) --
-it needs a real Chrome + (on Linux) a display or Xvfb, which most users of
-this package (FanMTL scraping only) don't need. solve_challenge_session()
-imports it locally so the rest of this module stays importable without it.
+`seleniumbase` and `curl_cffi` are NOT base dependencies (see
+requirements-novelupdates.txt) -- most users of this package (FanMTL scraping
+only) don't need them. solve_challenge_session() imports both locally so the
+rest of this module stays importable without them.
+
+**2026-08-02 finding**: a solved challenge's cookies replayed through a plain
+`requests.Session` still got a live 403 (confirmed by manual testing on real
+hardware -- the browser-based solve itself worked fine). Cloudflare Managed
+Challenges evidently also check the TLS handshake fingerprint, not just the
+`cf_clearance` cookie -- `requests`/urllib3's TLS stack doesn't look like real
+Chrome even with the right cookie and User-Agent header. Fixed by replaying
+through `curl_cffi` (`impersonate="chrome124"`, matching TLS fingerprint)
+instead of plain `requests` -- both expose the same `.get()`/`.post()`/
+`.cookies.set()`/response `.text`/`.raise_for_status()` shape, so search()/
+fetch_series() below don't need to know which one they were handed.
 """
 
 import argparse
+import time
 from typing import NamedTuple, Optional
 from urllib.parse import urljoin
 
-import requests
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.novelupdates.com"
@@ -59,23 +70,38 @@ def looks_like_challenge_page(html):
     return "<title>Just a moment" in html or "cf_chl_opt" in html
 
 
-def solve_challenge_session(url=BASE_URL):
+def solve_challenge_session(url=BASE_URL, max_solve_attempts=3, poll_delay=2.0):
     """Solve NU's Cloudflare challenge once with a real (SeleniumBase UC Mode)
-    browser, then hand back a plain requests.Session carrying its cookies --
-    Cloudflare ties the solved challenge to the session/IP, so this is meant
-    to be called once and reused for many search()/fetch_series() calls, not
-    per-lookup. UC Mode is explicitly detectable in headless mode per its own
-    docs -- xvfb=True (a virtual display) is used instead on Linux, so the
-    caller's machine needs Xvfb installed (see requirements-novelupdates.txt)."""
+    browser, then hand back a curl_cffi session (Chrome TLS fingerprint --
+    see module docstring for why plain requests doesn't work here) carrying
+    its cookies. Cloudflare ties the solved challenge to the session/IP, so
+    this is meant to be called once and reused for many search()/
+    fetch_series() calls, not per-lookup. UC Mode is explicitly detectable in
+    headless mode per its own docs -- xvfb=True (a virtual display) is used
+    instead on Linux, so the caller's machine needs Xvfb installed (see
+    requirements-novelupdates.txt)."""
+    from curl_cffi import requests as cf_requests  # local import -- see module docstring
     from seleniumbase import SB  # local import -- see module docstring
 
     with SB(uc=True, test=True, xvfb=True) as sb:
         sb.uc_open_with_reconnect(url, reconnect_time=4)
         sb.uc_gui_handle_captcha()
+
+        # uc_gui_handle_captcha() can return slightly before the resulting
+        # navigation/cookie-set actually lands -- poll page_source rather
+        # than trusting it's done after a single call.
+        for _ in range(max_solve_attempts):
+            if not looks_like_challenge_page(sb.driver.page_source):
+                break
+            time.sleep(poll_delay)
+        else:
+            raise ChallengeExpired(
+                f"Still looked like a challenge page after {max_solve_attempts} checks")
+
         cookies = sb.driver.get_cookies()
         user_agent = sb.driver.execute_script("return navigator.userAgent")
 
-    session = requests.Session()
+    session = cf_requests.Session(impersonate="chrome124")
     session.headers["User-Agent"] = user_agent
     for cookie in cookies:
         session.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain"))

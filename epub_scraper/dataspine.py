@@ -149,6 +149,10 @@ def cmd_enrich(args):
         print("Install requirements-novelupdates.txt (needs a real Chrome + Xvfb on Linux) "
               "and try `python -m epub_scraper.novelupdates check` first.")
         return
+    except novelupdates.ChallengeExpired as e:
+        print(f"Could not solve the Novel Updates challenge: {e}")
+        print("Try `python -m epub_scraper.novelupdates check` on its own to debug.")
+        return
 
     resolves_left = MAX_CHALLENGE_RESOLVES
     for i, row in enumerate(rows):

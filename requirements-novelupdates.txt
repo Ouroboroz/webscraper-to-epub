@@ -5,3 +5,4 @@
 # users who only want FanMTL scraping/EPUB building don't need.
 -r requirements.txt
 seleniumbase
+curl_cffi
