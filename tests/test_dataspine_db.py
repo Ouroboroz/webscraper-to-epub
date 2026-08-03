@@ -1,13 +1,16 @@
 import pytest
 
-from epub_scraper.dataspine_db import (all_tags, get_next_page, get_novel, init_db,
-                                        iter_candidates_missing_chapters,
+from epub_scraper.dataspine_db import (all_tags, count_labels, delete_most_recent_label,
+                                        first_chapter_excerpt, get_next_page, get_novel,
+                                        get_novel_by_id, init_db, iter_candidates_missing_chapters,
                                         iter_candidates_missing_embedding,
                                         iter_candidates_missing_metadata,
                                         iter_candidates_missing_nu_resolution, iter_embeddings,
-                                        iter_tag_cooccurrence, recompute_candidates, set_next_page,
-                                        stats, upsert_catalog_entry, upsert_chapters,
-                                        upsert_embedding, upsert_metadata, upsert_nu_metadata,
+                                        iter_labeled_novel_ids, iter_tag_cooccurrence,
+                                        label_counts_by_type, recompute_candidates, set_next_page,
+                                        stats, tags_for_novel, upsert_catalog_entry,
+                                        upsert_chapters, upsert_embedding, upsert_label,
+                                        upsert_metadata, upsert_nu_metadata,
                                         write_cluster_assignments, write_tag_communities)
 from epub_scraper.novelupdates import NUSeriesMetadata
 from epub_scraper.profile import CatalogEntry, MetadataResult
@@ -471,3 +474,143 @@ def test_stats_includes_nu_resolution_breakdown(db_path):
 
     summary = stats(conn, site_key="fanmtl")
     assert summary["candidates_by_nu_resolution"] == {"no_candidates": 1}
+
+
+# -- labeling (Stage 2) ----------------------------------------------------------
+
+def test_init_db_sets_wal_journal_mode(db_path):
+    conn = init_db(db_path)
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_init_db_memory_skips_wal(db_path):
+    conn = init_db(":memory:")
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "memory"
+
+
+def test_get_novel_by_id(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    conn.commit()
+    novel = get_novel(conn, "fanmtl", "https://x/novel/a.html")
+    assert get_novel_by_id(conn, novel["id"])["title"] == "A"
+    assert get_novel_by_id(conn, 99999) is None
+
+
+def test_upsert_label_then_get_roundtrips(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    conn.commit()
+    novel = get_novel(conn, "fanmtl", "https://x/novel/a.html")
+
+    upsert_label(conn, novel["id"], "like", source="cold")
+    conn.commit()
+
+    label = get_label(conn, novel["id"]) if False else conn.execute(
+        "SELECT * FROM labels WHERE novel_id = ?", (novel["id"],)).fetchone()
+    assert label["label"] == "like"
+    assert label["drop_chapter"] is None
+    assert label["source"] == "cold"
+
+
+def test_upsert_label_overwrites_on_relabel(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    conn.commit()
+    novel = get_novel(conn, "fanmtl", "https://x/novel/a.html")
+
+    upsert_label(conn, novel["id"], "like", source="cold")
+    conn.commit()
+    upsert_label(conn, novel["id"], "drop", drop_chapter=7, source="read")
+    conn.commit()
+
+    rows = conn.execute("SELECT * FROM labels").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["label"] == "drop"
+    assert rows[0]["drop_chapter"] == 7
+    assert rows[0]["source"] == "read"
+
+
+def test_count_labels_and_label_counts_by_type(db_path):
+    conn = init_db(db_path)
+    for i, label in enumerate(["like", "like", "meh", "drop"]):
+        upsert_catalog_entry(conn, make_entry(f"https://x/novel/{i}.html", 100, title=f"N{i}"),
+                              site_key="fanmtl")
+        conn.commit()
+        novel = get_novel(conn, "fanmtl", f"https://x/novel/{i}.html")
+        upsert_label(conn, novel["id"], label, source="cold")
+        conn.commit()
+
+    assert count_labels(conn) == 4
+    assert label_counts_by_type(conn) == {"like": 2, "meh": 1, "drop": 1}
+
+
+def test_iter_labeled_novel_ids(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    upsert_catalog_entry(conn, make_entry("https://x/novel/b.html", 100, title="B"), site_key="fanmtl")
+    conn.commit()
+    a = get_novel(conn, "fanmtl", "https://x/novel/a.html")
+    upsert_label(conn, a["id"], "like", source="cold")
+    conn.commit()
+
+    assert iter_labeled_novel_ids(conn) == {a["id"]}
+
+
+def test_delete_most_recent_label_removes_the_last_one_written(db_path):
+    conn = init_db(db_path)
+    ids = []
+    for i in range(3):
+        upsert_catalog_entry(conn, make_entry(f"https://x/novel/{i}.html", 100, title=f"N{i}"),
+                              site_key="fanmtl")
+        conn.commit()
+        novel = get_novel(conn, "fanmtl", f"https://x/novel/{i}.html")
+        upsert_label(conn, novel["id"], "like", source="cold")
+        conn.commit()
+        ids.append(novel["id"])
+
+    deleted = delete_most_recent_label(conn)
+    conn.commit()
+
+    assert deleted == ids[-1]
+    assert count_labels(conn) == 2
+    assert iter_labeled_novel_ids(conn) == set(ids[:-1])
+
+
+def test_delete_most_recent_label_returns_none_when_empty(db_path):
+    conn = init_db(db_path)
+    assert delete_most_recent_label(conn) is None
+
+
+def test_tags_for_novel(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    conn.commit()
+    upsert_metadata(conn, "fanmtl", "https://x/novel/a.html",
+                     MetadataResult(synopsis="S", genres=["Fantasy", "Action"], author=None,
+                                     alt_title=None, status=None, rating=None))
+    conn.commit()
+    novel = get_novel(conn, "fanmtl", "https://x/novel/a.html")
+    assert tags_for_novel(conn, novel["id"]) == ["Action", "Fantasy"]
+
+
+def test_first_chapter_excerpt_present_absent_and_truncated(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    upsert_catalog_entry(conn, make_entry("https://x/novel/b.html", 100, title="B"), site_key="fanmtl")
+    conn.commit()
+    a = get_novel(conn, "fanmtl", "https://x/novel/a.html")
+    b = get_novel(conn, "fanmtl", "https://x/novel/b.html")
+
+    assert first_chapter_excerpt(conn, b["id"]) is None  # no chapters at all
+
+    upsert_chapters(conn, a["id"], [(1, "Chapter 1", "Short opening.")])
+    conn.commit()
+    assert first_chapter_excerpt(conn, a["id"]) == "Short opening."
+
+    long_body = "x" * 1000
+    upsert_chapters(conn, a["id"], [(1, "Chapter 1", long_body)])
+    conn.commit()
+    excerpt = first_chapter_excerpt(conn, a["id"], max_chars=600)
+    assert len(excerpt) == 601  # 600 chars + the truncation ellipsis
+    assert excerpt.endswith("…")

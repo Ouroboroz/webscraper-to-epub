@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS chapters (
     fetched_at TEXT NOT NULL,
     PRIMARY KEY (novel_id, chapter_number)
 );
+
+CREATE TABLE IF NOT EXISTS labels (
+    novel_id INTEGER PRIMARY KEY REFERENCES novels(id),
+    label TEXT NOT NULL,
+    drop_chapter INTEGER,
+    source TEXT NOT NULL,
+    labeled_at TEXT NOT NULL
+);
 """
 
 
@@ -106,9 +114,27 @@ def _ensure_column(conn, table, name, decl):
 def init_db(path=DEFAULT_DB_PATH):
     """Open (creating if needed) the dataspine SQLite DB and ensure its schema
     exists. Returns a connection with Row-based access; callers are
-    responsible for commit()/close()."""
+    responsible for commit()/close().
+
+    WAL mode: needed once there's more than one process touching this file at
+    a time (Stage 0's background crawl/metadata/chapters/enrich pipeline plus
+    the Stage 2 labeling app now both hit the same dataspine.db concurrently)
+    -- the default rollback-journal mode takes an exclusive lock for the
+    whole duration of a write, which would otherwise surface as "database is
+    locked" errors under that concurrency. :memory: DBs don't support WAL
+    (no file to keep a -wal sidecar next to), so skip it there -- harmless
+    either way since an in-memory DB is never shared across processes.
+
+    busy_timeout: WAL still only allows one writer at a time -- confirmed
+    live (2026-08-03), labeling a book while the background metadata pass
+    was mid-write raised "database is locked" immediately, since the default
+    busy_timeout is 0 (fail instantly on contention rather than wait). 5s is
+    comfortably longer than a single commit ever takes here."""
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    if path != ":memory:":
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
     for name, decl in _NU_COLUMNS + _CHAPTER_COLUMNS + _CORPUS_STRUCTURE_COLUMNS:
         _ensure_column(conn, "novels", name, decl)
@@ -196,6 +222,33 @@ def get_novel(conn, site_key, url):
     return conn.execute(
         "SELECT * FROM novels WHERE site_key = ? AND url = ?", (site_key, url)
     ).fetchone()
+
+
+def get_novel_by_id(conn, novel_id):
+    return conn.execute("SELECT * FROM novels WHERE id = ?", (novel_id,)).fetchone()
+
+
+def tags_for_novel(conn, novel_id):
+    return [row["name"] for row in conn.execute(
+        "SELECT t.name FROM tags t JOIN novel_tags nt ON nt.tag_id = t.id "
+        "WHERE nt.novel_id = ? ORDER BY t.name",
+        (novel_id,),
+    )]
+
+
+def first_chapter_excerpt(conn, novel_id, max_chars=600):
+    """The opening of chapter 1 (or the earliest chapter actually landed, if
+    1 itself 404'd/decoyed out), truncated -- for the labeling app's
+    optional "chapter, if we have it" context. None if `chapters` has
+    nothing for this novel yet."""
+    row = conn.execute(
+        "SELECT body FROM chapters WHERE novel_id = ? ORDER BY chapter_number LIMIT 1",
+        (novel_id,),
+    ).fetchone()
+    if row is None or not row["body"]:
+        return None
+    body = row["body"]
+    return body if len(body) <= max_chars else body[:max_chars].rstrip() + "…"
 
 
 def iter_candidates_missing_metadata(conn, site_key, limit=None):
@@ -417,6 +470,51 @@ def write_tag_communities(conn, communities):
         "UPDATE tags SET community_id = ? WHERE id = ?",
         [(community_id, tag_id) for tag_id, community_id in communities.items()],
     )
+
+
+def upsert_label(conn, novel_id, label, drop_chapter=None, source="cold"):
+    """label: 'like' | 'meh' | 'drop'. drop_chapter only makes sense for a
+    'drop' recorded from source='read' -- a 'cold' judgment (never actually
+    read) has no chapter to attach. One label per novel; re-labeling
+    overwrites (upsert), same convention as upsert_metadata etc."""
+    conn.execute(
+        """
+        INSERT INTO labels (novel_id, label, drop_chapter, source, labeled_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(novel_id) DO UPDATE SET
+            label=excluded.label, drop_chapter=excluded.drop_chapter,
+            source=excluded.source, labeled_at=excluded.labeled_at
+        """,
+        (novel_id, label, drop_chapter, source, now_iso()),
+    )
+
+
+def get_label(conn, novel_id):
+    return conn.execute("SELECT * FROM labels WHERE novel_id = ?", (novel_id,)).fetchone()
+
+
+def count_labels(conn):
+    return conn.execute("SELECT COUNT(*) FROM labels").fetchone()[0]
+
+
+def label_counts_by_type(conn):
+    """dict[label -> count], e.g. {"like": 40, "meh": 12, "drop": 30} -- for
+    the labeling app's progress readout. Missing labels just aren't keys."""
+    return dict(conn.execute("SELECT label, COUNT(*) FROM labels GROUP BY label").fetchall())
+
+
+def iter_labeled_novel_ids(conn):
+    return {row["novel_id"] for row in conn.execute("SELECT novel_id FROM labels")}
+
+
+def delete_most_recent_label(conn):
+    """Single-level undo: remove whichever label was written last. Returns
+    the deleted novel_id, or None if there were no labels to undo."""
+    row = conn.execute("SELECT novel_id FROM labels ORDER BY labeled_at DESC LIMIT 1").fetchone()
+    if row is None:
+        return None
+    conn.execute("DELETE FROM labels WHERE novel_id = ?", (row["novel_id"],))
+    return row["novel_id"]
 
 
 def stats(conn, site_key=None):

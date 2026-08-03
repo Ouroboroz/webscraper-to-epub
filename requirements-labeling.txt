@@ -1,0 +1,10 @@
+# Optional: only needed for `python -m epub_scraper.labeling` (Stage 2: taste
+# labeling harness). Not part of the base requirements.txt because
+# python-fasthtml/uvicorn pull in a whole ASGI web stack and scikit-learn
+# pulls in numpy, which users who only want FanMTL scraping/EPUB building or
+# Stage 0/1's crawl/clustering don't need.
+-r requirements.txt
+python-fasthtml
+uvicorn
+scikit-learn
+numpy
