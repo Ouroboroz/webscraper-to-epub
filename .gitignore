@@ -12,6 +12,9 @@ logs/
 
 # Classification data spine (Stage 0) runtime DB -- mutates every crawl run
 dataspine.db
+dataspine.db-journal
+dataspine.db-wal
+dataspine.db-shm
 
 # Debug dump from a failed Novel Updates challenge solve
 nu_challenge_debug.html
