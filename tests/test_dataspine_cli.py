@@ -247,6 +247,30 @@ def test_cmd_enrich_resolves_session_expiry_mid_run(monkeypatch, db_path):
     assert novel["nu_resolution"] == "auto"
 
 
+def test_cmd_enrich_widens_pacer_on_429(monkeypatch, db_path, tmp_path):
+    # Confirmed live (2026-08-03): a real enrich run hit sustained 429s and
+    # the pacer never widened, because curl_cffi's HTTPError isn't a
+    # requests.HTTPError subclass, so fetcher.note_throttle() silently never
+    # matched it. FakeResponse's raise_for_status() raises a real
+    # requests.HTTPError here, but _note_nu_throttle() is duck-typed (checks
+    # .response.status_code, not the exception class), so this exercises the
+    # same code path a real curl_cffi 429 would.
+    _crawl_one(monkeypatch, db_path, "ri1", title="Reverend Insanity")
+
+    nu_session = FakeSession({
+        NU_AJAX_URL: FakeResponse("", 429, NU_AJAX_URL),
+    })
+    monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", lambda *a, **kw: nu_session)
+
+    pacing_file = tmp_path / "pacing.json"
+    run_cli(monkeypatch, ["enrich", "--pacing-file", str(pacing_file), "--db", db_path],
+            FakeSession({}))
+
+    import json
+    pacing = json.loads(pacing_file.read_text())
+    assert pacing["novelupdates"] > 2.5  # default enrich --delay, widened past it
+
+
 def test_cmd_enrich_no_pending_candidates_prints_message(monkeypatch, db_path, capsys):
     run_cli(monkeypatch, ["enrich", "--db", db_path], FakeSession({}))
     assert "No candidates pending Novel Updates enrichment" in capsys.readouterr().out

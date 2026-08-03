@@ -48,12 +48,12 @@ All three long-running commands share the same Pacer (epub_scraper.pacing --
 originally built for the chapter scraper) via --pacing-file: a persisted,
 jittered per-site interval that widens on a 429 or a detected challenge page
 and never resets on its own. `crawl`/`metadata` route fetch failures through
-it via fetcher.note_throttle(); `enrich`'s Novel Updates calls don't go
-through epub_scraper.fetcher at all (curl_cffi, not requests, and
-ChallengeExpired rather than ChallengeDetected/HTTPError) so they keep their
-own existing re-solve logic, just using the Pacer for its paced sleep too --
-one persisted pacing.json across the whole pipeline instead of a second,
-disconnected mechanism.
+fetcher.note_throttle(); `enrich`'s Novel Updates calls go through curl_cffi,
+not requests, so they use a separate duck-typed _note_nu_throttle() for the
+same 429-widening behavior (curl_cffi's HTTPError isn't a requests.HTTPError
+subclass, confirmed live -- note_throttle() would silently never match it)
+and keep their own existing ChallengeExpired re-solve logic on top -- one
+persisted pacing.json across the whole pipeline either way.
 """
 
 import argparse
@@ -95,6 +95,26 @@ def _session():
 def _is_permanent_404(e):
     return (isinstance(e, requests.HTTPError) and e.response is not None
             and e.response.status_code == 404)
+
+
+def _note_nu_throttle(pacer, e):
+    """fetcher.note_throttle() only recognizes requests.HTTPError -- Novel
+    Updates calls go through curl_cffi instead (see novelupdates.py), whose
+    HTTPError is a structurally similar but genuinely unrelated exception
+    type (confirmed: not a requests.HTTPError subclass), so note_throttle()
+    silently never matches it. Found live (2026-08-03): a real enrich run hit
+    sustained 429s in its last ~14 candidates and the pacer never widened,
+    meaning every one of those requests fired at the same unthrottled
+    interval that had already started failing. Duck-typed equivalent for the
+    one thing that matters here, since curl_cffi's Response still exposes
+    the same .status_code/.headers shape requests does."""
+    response = getattr(e, "response", None)
+    if getattr(response, "status_code", None) != 429:
+        return False
+    headers = getattr(response, "headers", None)
+    retry_after = headers.get("Retry-After") if headers is not None else None
+    pacer.throttled(NU_SITE_KEY, retry_after=retry_after)
+    return True
 
 
 def _fetch_page_with_retry(url, session, pacer, site_key, max_retries=MAX_PAGE_RETRIES):
@@ -271,6 +291,7 @@ def cmd_enrich(args):
                       f"{row['title']!r}, skipping for this run")
                 continue
         except Exception as e:
+            _note_nu_throttle(pacer, e)
             print(f"[{i + 1}/{len(rows)}] error resolving {row['title']!r}: {e}")
             continue
 
