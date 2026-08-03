@@ -1,12 +1,14 @@
 import pytest
 
-from epub_scraper.dataspine_db import (get_next_page, get_novel, init_db,
+from epub_scraper.dataspine_db import (all_tags, get_next_page, get_novel, init_db,
                                         iter_candidates_missing_chapters,
+                                        iter_candidates_missing_embedding,
                                         iter_candidates_missing_metadata,
-                                        iter_candidates_missing_nu_resolution,
-                                        recompute_candidates, set_next_page, stats,
-                                        upsert_catalog_entry, upsert_chapters, upsert_metadata,
-                                        upsert_nu_metadata)
+                                        iter_candidates_missing_nu_resolution, iter_embeddings,
+                                        iter_tag_cooccurrence, recompute_candidates, set_next_page,
+                                        stats, upsert_catalog_entry, upsert_chapters,
+                                        upsert_embedding, upsert_metadata, upsert_nu_metadata,
+                                        write_cluster_assignments, write_tag_communities)
 from epub_scraper.novelupdates import NUSeriesMetadata
 from epub_scraper.profile import CatalogEntry, MetadataResult
 
@@ -327,6 +329,135 @@ def test_stats_includes_chapters_progress(db_path):
 
     summary = stats(conn, site_key="fanmtl")
     assert summary["candidates_with_chapters"] == 1
+
+
+# -- corpus structure (Stage 1) -------------------------------------------------
+
+def _fake_embedding_bytes(*values):
+    # Tiny hand-built vectors stand in for a real BGE-M3 embedding -- these
+    # tests exercise the DB round-trip, not sentence-transformers itself.
+    import numpy as np
+    return np.array(values, dtype=np.float32).tobytes()
+
+
+def test_iter_candidates_missing_embedding_requires_synopsis_first(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    conn.commit()
+    recompute_candidates(conn, min_chapters=80, site_key="fanmtl")
+    conn.commit()
+
+    # No synopsis yet -- not pending an embedding (nothing to embed).
+    assert iter_candidates_missing_embedding(conn, "fanmtl") == []
+
+    upsert_metadata(conn, "fanmtl", "https://x/novel/a.html",
+                     MetadataResult(synopsis="S", genres=[], author=None,
+                                     alt_title=None, status=None, rating=None))
+    conn.commit()
+    assert [row["title"] for row in iter_candidates_missing_embedding(conn, "fanmtl")] == ["A"]
+
+
+def test_upsert_embedding_then_iter_roundtrips(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    conn.commit()
+    recompute_candidates(conn, min_chapters=80, site_key="fanmtl")
+    conn.commit()
+    upsert_metadata(conn, "fanmtl", "https://x/novel/a.html",
+                     MetadataResult(synopsis="S", genres=[], author=None,
+                                     alt_title=None, status=None, rating=None))
+    conn.commit()
+    novel = get_novel(conn, "fanmtl", "https://x/novel/a.html")
+
+    blob = _fake_embedding_bytes(1.0, 2.0, 3.0)
+    upsert_embedding(conn, novel["id"], blob)
+    conn.commit()
+
+    assert iter_candidates_missing_embedding(conn, "fanmtl") == []
+    pairs = iter_embeddings(conn, "fanmtl")
+    assert pairs == [(novel["id"], blob)]
+
+
+def test_write_cluster_assignments_updates_every_novel(db_path):
+    conn = init_db(db_path)
+    ids = []
+    for i in range(3):
+        upsert_catalog_entry(conn, make_entry(f"https://x/novel/{i}.html", 100, title=f"N{i}"),
+                              site_key="fanmtl")
+        conn.commit()
+        ids.append(get_novel(conn, "fanmtl", f"https://x/novel/{i}.html")["id"])
+
+    write_cluster_assignments(conn, {
+        ids[0]: (0, 1.0, 2.0),
+        ids[1]: (0, 1.1, 2.1),
+        ids[2]: (-1, 5.0, 5.0),
+    })
+    conn.commit()
+
+    rows = {r["id"]: r for r in conn.execute("SELECT * FROM novels")}
+    assert rows[ids[0]]["cluster_id"] == 0
+    assert rows[ids[0]]["umap_x"] == 1.0
+    assert rows[ids[2]]["cluster_id"] == -1
+
+
+def test_all_tags_and_write_tag_communities_roundtrip(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    conn.commit()
+    upsert_metadata(conn, "fanmtl", "https://x/novel/a.html",
+                     MetadataResult(synopsis="S", genres=["Fantasy", "Action"], author=None,
+                                     alt_title=None, status=None, rating=None))
+    conn.commit()
+
+    tags = all_tags(conn)
+    assert {row["name"] for row in tags} == {"Fantasy", "Action"}
+
+    write_tag_communities(conn, {row["id"]: 0 for row in tags})
+    conn.commit()
+
+    community_ids = {row["community_id"] for row in conn.execute("SELECT community_id FROM tags")}
+    assert community_ids == {0}
+
+
+def test_stats_includes_embedding_progress(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    conn.commit()
+    recompute_candidates(conn, min_chapters=80, site_key="fanmtl")
+    conn.commit()
+    upsert_metadata(conn, "fanmtl", "https://x/novel/a.html",
+                     MetadataResult(synopsis="S", genres=[], author=None,
+                                     alt_title=None, status=None, rating=None))
+    conn.commit()
+    novel = get_novel(conn, "fanmtl", "https://x/novel/a.html")
+    upsert_embedding(conn, novel["id"], _fake_embedding_bytes(1.0, 2.0))
+    conn.commit()
+
+    summary = stats(conn, site_key="fanmtl")
+    assert summary["candidates_with_embedding"] == 1
+
+
+def test_iter_tag_cooccurrence_counts_shared_novels_without_self_pairs_or_duplicates(db_path):
+    conn = init_db(db_path)
+    # A+B co-occur on 2 novels, A+C on 1 novel, B+C never.
+    for i, genres in enumerate([["A", "B"], ["A", "B"], ["A", "C"]]):
+        url = f"https://x/novel/{i}.html"
+        upsert_catalog_entry(conn, make_entry(url, 100, title=f"N{i}"), site_key="fanmtl")
+        conn.commit()
+        upsert_metadata(conn, "fanmtl", url,
+                         MetadataResult(synopsis="S", genres=genres, author=None,
+                                         alt_title=None, status=None, rating=None))
+        conn.commit()
+
+    tag_id = {row["name"]: row["id"] for row in all_tags(conn)}
+    pairs = {(row["tag_id_a"], row["tag_id_b"]): row["weight"] for row in iter_tag_cooccurrence(conn)}
+
+    a, b, c = tag_id["A"], tag_id["B"], tag_id["C"]
+    expected_key = (min(a, b), max(a, b))
+    assert pairs[expected_key] == 2
+    assert pairs[(min(a, c), max(a, c))] == 1
+    assert (min(b, c), max(b, c)) not in pairs  # never co-occur
+    assert (a, a) not in pairs  # no self-pairs
 
 
 def test_stats_includes_nu_resolution_breakdown(db_path):

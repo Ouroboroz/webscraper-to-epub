@@ -1,0 +1,11 @@
+# Optional: only needed for `python -m epub_scraper.dataspine embed` /
+# `cluster` / `tag-communities` (Stage 1: corpus structure). Not part of the
+# base requirements.txt because sentence-transformers pulls in torch and a
+# multi-hundred-MB embedding model download, which users who only want
+# FanMTL scraping/EPUB building or Stage 0's crawl don't need.
+-r requirements.txt
+sentence-transformers
+umap-learn
+hdbscan
+python-igraph
+leidenalg

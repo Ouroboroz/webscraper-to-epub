@@ -13,6 +13,9 @@ Usage:
                                            [--delay SECS] [--pacing-file FILE] [--db FILE]
   python -m epub_scraper.dataspine chapters [--count N] [--limit N] [--delay SECS]
                                              [--pacing-file FILE] [--db FILE]
+  python -m epub_scraper.dataspine embed [--limit N] [--model NAME] [--db FILE]
+  python -m epub_scraper.dataspine cluster [--umap-dims N] [--min-cluster-size N] [--db FILE]
+  python -m epub_scraper.dataspine tag-communities [--db FILE]
   python -m epub_scraper.dataspine stats [--db FILE]
 
 `crawl` paginates the catalog browse listing (30 novels/page, thousands of
@@ -32,7 +35,14 @@ alone can't capture (pacing, prose quality, whether the hook lands) --
 reuses epub_scraper.scrape.scrape_chapters() (the same engine the interactive
 EPUB-download pipeline uses, including its on-disk .cache/, so a chapter
 sampled here is already warm if the novel later gets a full download)
-instead of a second chapter fetcher.
+instead of a second chapter fetcher. `embed`/`cluster`/`tag-communities` are
+Stage 1 (corpus structure) -- pure local computation, no network at all, see
+epub_scraper/corpus_structure.py's docstring. They only need `synopsis` +
+tags (already available once `metadata`/`enrich` have run on a candidate),
+not `chapters` or a fully-finished `enrich`. Unlike the other subcommands,
+`cluster`/`tag-communities` are full recomputes over the whole corpus each
+time, not incremental -- a cluster boundary can shift for every novel as the
+corpus grows.
 
 All three long-running commands share the same Pacer (epub_scraper.pacing --
 originally built for the chapter scraper) via --pacing-file: a persisted,
@@ -52,7 +62,7 @@ import time
 import requests
 from bs4 import BeautifulSoup
 
-from . import entity_resolution, novelupdates
+from . import corpus_structure, entity_resolution, novelupdates
 from .dataspine_db import (DEFAULT_DB_PATH, get_next_page, get_novel, init_db,
                             iter_candidates_missing_chapters, iter_candidates_missing_metadata,
                             iter_candidates_missing_nu_resolution, recompute_candidates,
@@ -302,6 +312,49 @@ def cmd_chapters(args):
             time.sleep(pacer.gap(SITE_KEY))
 
 
+def cmd_embed(args):
+    conn = init_db(args.db)
+    try:
+        n = corpus_structure.embed_synopses(conn, SITE_KEY, model_name=args.model, limit=args.limit)
+    except ImportError as e:
+        print(f"Could not embed: {e}")
+        print("Install requirements-ml.txt (sentence-transformers + torch) first.")
+        return
+    if n == 0:
+        print("No candidates pending an embedding (need a synopsis first -- run `metadata`).")
+    else:
+        print(f"Embedded {n} synopses with {args.model!r}.")
+
+
+def cmd_cluster(args):
+    conn = init_db(args.db)
+    try:
+        n, n_clusters, n_outliers = corpus_structure.cluster_corpus(
+            conn, SITE_KEY, umap_dims=args.umap_dims, min_cluster_size=args.min_cluster_size)
+    except ImportError as e:
+        print(f"Could not cluster: {e}")
+        print("Install requirements-ml.txt (umap-learn + hdbscan) first.")
+        return
+    if n == 0:
+        print("No candidates with an embedding yet -- run `embed` first.")
+    else:
+        print(f"Clustered {n} novels into {n_clusters} clusters ({n_outliers} outliers).")
+
+
+def cmd_tag_communities(args):
+    conn = init_db(args.db)
+    try:
+        n_tags, n_communities = corpus_structure.build_tag_communities(conn)
+    except ImportError as e:
+        print(f"Could not build tag communities: {e}")
+        print("Install requirements-ml.txt (python-igraph + leidenalg) first.")
+        return
+    if n_tags == 0:
+        print("No tags yet -- run `metadata`/`enrich` first.")
+    else:
+        print(f"Grouped {n_tags} tags into {n_communities} communities.")
+
+
 def cmd_stats(args):
     conn = init_db(args.db)
     summary = stats(conn, site_key=SITE_KEY)
@@ -309,6 +362,7 @@ def cmd_stats(args):
     print(f"Candidates       : {summary['candidates']}")
     print(f"  with metadata  : {summary['candidates_with_metadata']}")
     print(f"  with chapters  : {summary['candidates_with_chapters']}")
+    print(f"  with embedding : {summary['candidates_with_embedding']}")
     print("  by status:")
     for status, count in sorted(summary["candidates_by_status"].items(),
                                  key=lambda kv: -kv[1]):
@@ -371,6 +425,24 @@ def build_parser():
                                   "if the novel later gets a full download")
     p_chapters.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
     p_chapters.set_defaults(func=cmd_chapters)
+
+    p_embed = sub.add_parser("embed", help="Embed each candidate's synopsis (Stage 1)")
+    p_embed.add_argument("--limit", type=int, default=200, metavar="N")
+    p_embed.add_argument("--model", default=corpus_structure.DEFAULT_EMBEDDING_MODEL, metavar="NAME")
+    p_embed.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
+    p_embed.set_defaults(func=cmd_embed)
+
+    p_cluster = sub.add_parser(
+        "cluster", help="UMAP+HDBSCAN cluster every embedded candidate (Stage 1, full recompute)")
+    p_cluster.add_argument("--umap-dims", type=int, default=8, metavar="N")
+    p_cluster.add_argument("--min-cluster-size", type=int, default=10, metavar="N")
+    p_cluster.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
+    p_cluster.set_defaults(func=cmd_cluster)
+
+    p_tag_communities = sub.add_parser(
+        "tag-communities", help="Leiden-cluster the tag co-occurrence graph (Stage 1, full recompute)")
+    p_tag_communities.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
+    p_tag_communities.set_defaults(func=cmd_tag_communities)
 
     p_stats = sub.add_parser("stats", help="Show crawl/candidate progress")
     p_stats.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
