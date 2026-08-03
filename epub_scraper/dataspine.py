@@ -92,15 +92,27 @@ def _session():
     return session
 
 
+def _is_permanent_404(e):
+    return (isinstance(e, requests.HTTPError) and e.response is not None
+            and e.response.status_code == 404)
+
+
 def _fetch_page_with_retry(url, session, pacer, site_key, max_retries=MAX_PAGE_RETRIES):
     """fetch() a catalog page, widening the pacer and retrying (bounded) on
     failure instead of letting one transient error/429/challenge kill an
-    entire multi-hour unattended crawl. Re-raises after max_retries."""
+    entire multi-hour unattended crawl. Re-raises after max_retries.
+
+    A 404 is NOT retried -- confirmed live (2026-08-03) that FanMTL returns a
+    stable 404, not an empty 200, once a page number is past its current
+    catalog boundary, so retrying it just burns 5 rounds of backoff on a
+    condition that will never change within this run."""
     attempt = 0
     while True:
         try:
             return fetch(url, session)
         except Exception as e:
+            if _is_permanent_404(e):
+                raise
             note_throttle(pacer, site_key, e)
             attempt += 1
             if attempt > max_retries:
@@ -126,7 +138,12 @@ def cmd_crawl(args):
         try:
             html = _fetch_page_with_retry(url, session, pacer, SITE_KEY)
         except Exception as e:
-            print(f"Error fetching page {page} (giving up after {MAX_PAGE_RETRIES} retries): {e}")
+            if _is_permanent_404(e):
+                print(f"Page {page} returned 404 -- reached the current end of the catalog. "
+                      f"(This boundary moves as new novels get added -- a future crawl may "
+                      f"find more here, so it's re-checked rather than remembered as final.)")
+            else:
+                print(f"Error fetching page {page} (giving up after {MAX_PAGE_RETRIES} retries): {e}")
             set_next_page(conn, SITE_KEY, page)
             conn.commit()
             break

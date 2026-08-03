@@ -122,6 +122,23 @@ def test_cmd_crawl_gives_up_after_max_retries_and_persists_resume_point(
     assert get_next_page(conn, "fanmtl") == 0  # resumes at the same failed page next time
 
 
+def test_cmd_crawl_stops_cleanly_on_404_without_retrying(monkeypatch, db_path, tmp_path, capsys):
+    # Confirmed live (2026-08-03): FanMTL returns a stable 404, not an empty
+    # 200, once a page number is past the catalog's current end -- retrying
+    # that like a transient error just burns 5 rounds of backoff for nothing.
+    monkeypatch.setattr(dataspine.time, "sleep", lambda secs: None)
+    session = FakeSession({page_url(0): FakeResponse("", 404, page_url(0))})
+    run_cli(monkeypatch, ["crawl", "--pacing-file", str(tmp_path / "pacing.json"),
+                          "--db", db_path], session)
+
+    out = capsys.readouterr().out
+    assert "reached the current end of the catalog" in out
+    assert "giving up after" not in out
+    assert len(session.calls) == 1  # no retries -- a 404 is a permanent condition, not transient
+    conn = init_db(db_path)
+    assert get_next_page(conn, "fanmtl") == 0  # still re-checked next time -- the boundary moves
+
+
 def test_cmd_metadata_fills_in_synopsis_for_pending_candidate(monkeypatch, db_path):
     page0 = fanmtl_catalog_html([("Porter's", "kks30150", 300, "Ongoing")])
     crawl_session = FakeSession({
