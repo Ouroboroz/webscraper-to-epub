@@ -254,6 +254,49 @@ then in another shell: `tail -f logs/dataspine_crawl.log`.
 Output lives in `dataspine.db` (gitignored — mutates every run) and `pacing.json`; both stay at
 whatever path `--db`/`--pacing-file` point to.
 
+### Corpus structure (Stage 1)
+
+A second layer on top of the same `dataspine.db`: understand what the corpus *contains*
+(thematic clusters + tag communities) rather than adding more data to it. Pure local
+computation — no network calls, no site to be polite to — so there's no pacing/resume story here
+beyond what `embed` already gets from being resumable like `metadata`/`chapters`/`enrich`.
+Produces zero recommendations by design; that's a later stage's job.
+
+**Setup**: needs `requirements-ml.txt` (sentence-transformers + torch + umap-learn + hdbscan +
+python-igraph + leidenalg — pulls in a real embedding model and, ideally, a GPU). Not part of
+`requirements-ml.txt`'s sibling files because this is a meaningfully heavier, ML-specific
+dependency set than either the base scraper or Novel Updates enrichment need.
+
+```
+pip install -r requirements-ml.txt
+```
+
+| Command | Purpose |
+|---|---|
+| `embed [--limit N] [--model NAME] [--db FILE]` | Embed each candidate's synopsis (default model: `BAAI/bge-m3`) — resumable, only embeds candidates missing one |
+| `cluster [--umap-dims N] [--min-cluster-size N] [--db FILE]` | UMAP-reduce + HDBSCAN every embedded candidate into `cluster_id` (full recompute, not incremental — see below) |
+| `tag-communities [--db FILE]` | Leiden-cluster the tag co-occurrence graph into `community_id` per tag (also a full recompute) |
+
+```
+python -m epub_scraper.dataspine embed --limit 1000000 --db dataspine.db
+python -m epub_scraper.dataspine cluster --db dataspine.db
+python -m epub_scraper.dataspine tag-communities --db dataspine.db
+```
+
+`embed` only needs `synopsis` (from `metadata`), not `chapters` or a finished `enrich` run — it's
+usable as soon as `metadata` has processed anything, and just gets a richer tag graph as `enrich`
+continues in the background. Unlike `crawl`/`metadata`/`chapters`/`enrich`, `cluster` and
+`tag-communities` are **full recomputes** every time, not incremental — a cluster boundary can
+shift for every novel as the corpus grows, so there's no meaningful "resume" for them; just
+re-run them after `embed` has processed more candidates.
+
+Verified live (2026-08-03) against 1,510 real novels: embedded in ~46s on a consumer GPU, 14
+clusters + 786 outliers, and the clusters are genuinely thematically coherent (clean separation by
+crossover fandom — Naruto, Douluo Continent, Pokémon, Hogwarts, One Piece, Marvel each formed
+their own cluster — and by genre, e.g. cultivation novels separate from modern-urban/business
+rebirth novels). `synopsis_embedding` is stored as a raw float32 BLOB directly on the `novels`
+table (`numpy.tobytes()`/`np.frombuffer()`) rather than a second store.
+
 ## Output files
 
 EPUBs are written to `epubs/` as:
@@ -308,11 +351,14 @@ epub_scraper/
   fetcher.py      HTTP fetch with shared headers
   sites/          one SiteProfile per supported aggregator site
   tools/          standalone helpers (e.g. fetch_sample.py) for site onboarding
-  dataspine.py       Stage 0 CLI (crawl/metadata/chapters/enrich/stats) -- see
-                     "Classification Data Spine" section above
+  dataspine.py       Stage 0/1 CLI (crawl/metadata/chapters/enrich/embed/cluster/
+                     tag-communities/stats) -- see "Classification Data Spine" and
+                     "Corpus structure" sections above
   dataspine_db.py    SQLite schema + helpers for dataspine.py
   novelupdates.py    Novel Updates challenge-solving, search, series-page scraping
   entity_resolution.py  FanMTL <-> Novel Updates title matching (RapidFuzz cascade)
+  corpus_structure.py    Stage 1: synopsis embedding, UMAP+HDBSCAN clustering,
+                         tag-community detection (Leiden) -- pure local computation
 scripts/
   check_updates.sh   cron-friendly wrapper around `update check` (lockfile + logging)
 tests/

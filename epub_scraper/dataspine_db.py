@@ -77,6 +77,23 @@ _CHAPTER_COLUMNS = [
     ("chapters_sampled_at", "TEXT"),
 ]
 
+# Stage 1 (corpus structure/clustering) columns. synopsis_embedding is a raw
+# BLOB -- a float32 numpy array's .tobytes() -- deliberately stored/returned
+# as opaque bytes by every helper below rather than decoded here, so this
+# module (used by the base crawl/metadata/chapters/enrich pipeline) never
+# needs numpy itself; only epub_scraper/corpus_structure.py, which already
+# depends on it for real, does the encode/decode.
+_CORPUS_STRUCTURE_COLUMNS = [
+    ("synopsis_embedding", "BLOB"),
+    ("cluster_id", "INTEGER"),
+    ("umap_x", "REAL"),
+    ("umap_y", "REAL"),
+]
+
+_TAG_COLUMNS = [
+    ("community_id", "INTEGER"),
+]
+
 
 def _ensure_column(conn, table, name, decl):
     # table/name/decl are always internal literals from _NU_COLUMNS above,
@@ -93,8 +110,10 @@ def init_db(path=DEFAULT_DB_PATH):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
-    for name, decl in _NU_COLUMNS + _CHAPTER_COLUMNS:
+    for name, decl in _NU_COLUMNS + _CHAPTER_COLUMNS + _CORPUS_STRUCTURE_COLUMNS:
         _ensure_column(conn, "novels", name, decl)
+    for name, decl in _TAG_COLUMNS:
+        _ensure_column(conn, "tags", name, decl)
     conn.commit()
     return conn
 
@@ -327,6 +346,79 @@ def upsert_chapters(conn, novel_id, chapters):
     conn.execute("UPDATE novels SET chapters_sampled_at = ? WHERE id = ?", (now, novel_id))
 
 
+def iter_candidates_missing_embedding(conn, site_key, limit=None):
+    """Candidates with a synopsis but no stored embedding yet. Ordered by id,
+    same resumability shape as the other iter_candidates_missing_* helpers."""
+    sql = ("SELECT * FROM novels WHERE site_key = ? AND candidate = 1 "
+           "AND synopsis IS NOT NULL AND synopsis_embedding IS NULL ORDER BY id")
+    params = [site_key]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
+def upsert_embedding(conn, novel_id, embedding_bytes):
+    """embedding_bytes: a float32 numpy array's .tobytes() -- see the
+    _CORPUS_STRUCTURE_COLUMNS comment for why this module treats it as
+    opaque bytes rather than decoding it."""
+    conn.execute("UPDATE novels SET synopsis_embedding = ? WHERE id = ?",
+                 (embedding_bytes, novel_id))
+
+
+def iter_embeddings(conn, site_key):
+    """[(novel_id, embedding_bytes), ...] for every candidate with a stored
+    embedding -- decode with np.frombuffer(blob, dtype=np.float32)."""
+    rows = conn.execute(
+        "SELECT id, synopsis_embedding FROM novels "
+        "WHERE site_key = ? AND candidate = 1 AND synopsis_embedding IS NOT NULL",
+        (site_key,),
+    ).fetchall()
+    return [(row["id"], row["synopsis_embedding"]) for row in rows]
+
+
+def write_cluster_assignments(conn, assignments):
+    """assignments: dict[novel_id, (cluster_id, umap_x, umap_y)]. A full
+    recompute over whatever embeddings currently exist, not incremental --
+    every novel's cluster can shift when the corpus grows, unlike the
+    append-only per-novel fetches elsewhere in this module."""
+    conn.executemany(
+        "UPDATE novels SET cluster_id = ?, umap_x = ?, umap_y = ? WHERE id = ?",
+        [(cluster_id, x, y, novel_id) for novel_id, (cluster_id, x, y) in assignments.items()],
+    )
+
+
+def all_tags(conn):
+    """[(tag_id, name), ...] for every tag -- corpus_structure.py needs the
+    full node set for its co-occurrence graph, including tags that never
+    co-occur with anything (iter_tag_cooccurrence alone would miss those)."""
+    return conn.execute("SELECT id, name FROM tags").fetchall()
+
+
+def iter_tag_cooccurrence(conn):
+    """[(tag_id_a, tag_id_b, weight), ...] for every pair of tags that
+    co-occur on at least one novel, weight = how many novels share both.
+    a.tag_id < b.tag_id avoids double-counting and self-pairs. Explicit
+    aliases (not just `a.tag_id, b.tag_id`) since sqlite3.Row's name-based
+    access can't distinguish two same-named columns otherwise."""
+    return conn.execute(
+        """
+        SELECT a.tag_id AS tag_id_a, b.tag_id AS tag_id_b, COUNT(*) as weight
+        FROM novel_tags a JOIN novel_tags b
+            ON a.novel_id = b.novel_id AND a.tag_id < b.tag_id
+        GROUP BY a.tag_id, b.tag_id
+        """
+    ).fetchall()
+
+
+def write_tag_communities(conn, communities):
+    """communities: dict[tag_id, community_id]."""
+    conn.executemany(
+        "UPDATE tags SET community_id = ? WHERE id = ?",
+        [(community_id, tag_id) for tag_id, community_id in communities.items()],
+    )
+
+
 def stats(conn, site_key=None):
     """Summary counts: total catalogued, candidates, candidates with metadata
     already fetched, and a status -> count breakdown among candidates."""
@@ -348,6 +440,11 @@ def stats(conn, site_key=None):
         "candidate = 1 AND chapters_sampled_at IS NOT NULL",
         params,
     ).fetchone()[0]
+    with_embedding = conn.execute(
+        f"SELECT COUNT(*) FROM novels {where}{' AND' if where else 'WHERE'} "
+        "candidate = 1 AND synopsis_embedding IS NOT NULL",
+        params,
+    ).fetchone()[0]
     by_status = dict(conn.execute(
         f"SELECT status, COUNT(*) FROM novels {where}{' AND' if where else 'WHERE'} "
         "candidate = 1 GROUP BY status",
@@ -364,6 +461,7 @@ def stats(conn, site_key=None):
         "candidates": candidates,
         "candidates_with_metadata": with_metadata,
         "candidates_with_chapters": with_chapters,
+        "candidates_with_embedding": with_embedding,
         "candidates_by_status": by_status,
         "candidates_by_nu_resolution": by_nu_resolution,
     }
