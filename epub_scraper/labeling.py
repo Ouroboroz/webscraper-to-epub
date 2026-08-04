@@ -262,6 +262,52 @@ def record_label(conn, novel_id, label, drop_chapter=None, source="cold"):
     conn.commit()
 
 
+def build_search_index(conn, site_key):
+    """[{id, title, author, status}, ...] for every candidate -- deliberately
+    lightweight (no synopsis/tags): for the "label a book you've read"
+    search flow, which doesn't need synopsis at all (you already know the
+    book) -- built so this whole index is small enough to ship somewhere
+    this DB isn't reachable (see export_offline_labeling_data below)."""
+    rows = conn.execute(
+        "SELECT id, title, author, status FROM novels "
+        "WHERE site_key = ? AND candidate = 1 ORDER BY id",
+        (site_key,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def build_review_batch(conn, site_key, total_target=LABEL_TARGET):
+    """Full-detail rows (title/author/status/synopsis/cluster_id/tags) for
+    the same novel_ids build_seed_queue would hand the review-queue UI, in
+    the same order -- for shipping a cold-review batch somewhere this DB
+    isn't reachable. Already-labeled novels are excluded (build_seed_queue's
+    own job), so re-exporting after a round of importing labels naturally
+    produces a fresh batch, not a repeat of what's already been judged."""
+    return [
+        {
+            "id": novel["id"], "title": novel["title"], "author": novel["author"],
+            "status": novel["status"], "synopsis": novel["synopsis"],
+            "cluster_id": novel["cluster_id"], "tags": tags_for_novel(conn, novel["id"]),
+        }
+        for novel in (get_novel_by_id(conn, novel_id)
+                      for novel_id in build_seed_queue(conn, site_key, total_target=total_target))
+    ]
+
+
+def import_offline_labels(conn, entries):
+    """entries: iterable of {novel_id, label, source, drop_chapter}, the
+    shape a portable/offline labeling surface exports. Writes each through
+    record_label (same validation/upsert/commit as the live app), so a bad
+    entry (unknown novel_id or invalid label) fails loudly rather than
+    silently corrupting the labels table. Returns how many were imported."""
+    count = 0
+    for entry in entries:
+        record_label(conn, entry["novel_id"], entry["label"],
+                      drop_chapter=entry.get("drop_chapter"), source=entry.get("source", "cold"))
+        count += 1
+    return count
+
+
 # ============================================================================
 # FastHTML/HTMX app -- everything below is the untested UI/integration layer.
 # Every route is a thin wrapper: parse the request, call a function above,
@@ -629,17 +675,66 @@ def build_app(db_path=DEFAULT_DB_PATH):
     return app
 
 
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(prog="python -m epub_scraper.labeling")
-    parser.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, metavar="N")
-    args = parser.parse_args()
-
+def cmd_serve(args):
     import uvicorn
     app = build_app(args.db)
     uvicorn.run(app, host="127.0.0.1", port=args.port)
+
+
+def cmd_export(args):
+    import json
+
+    conn = init_db(args.db)
+    search_index = build_search_index(conn, SITE_KEY)
+    review_batch = build_review_batch(conn, SITE_KEY, total_target=args.batch_target)
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump({"search_index": search_index, "review_batch": review_batch}, f)
+    print(f"Exported {len(search_index)} searchable novels and a {len(review_batch)}-novel "
+          f"review batch to {args.out}")
+
+
+def cmd_import_labels(args):
+    import json
+
+    conn = init_db(args.db)
+    with open(args.file, encoding="utf-8") as f:
+        payload = json.load(f)
+    entries = payload["labels"] if isinstance(payload, dict) else payload
+    count = import_offline_labels(conn, entries)
+    print(f"Imported {count} labels from {args.file}")
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m epub_scraper.labeling",
+        description="Stage 2: taste labeling -- run the local app, or export/import for a "
+                     "portable labeling surface that doesn't have direct DB access.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_serve = sub.add_parser("serve", help="Run the FastHTML labeling app")
+    p_serve.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
+    p_serve.add_argument("--port", type=int, default=DEFAULT_PORT, metavar="N")
+    p_serve.set_defaults(func=cmd_serve)
+
+    p_export = sub.add_parser(
+        "export", help="Export a search index + review batch as JSON for offline/portable labeling")
+    p_export.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
+    p_export.add_argument("--batch-target", type=int, default=LABEL_TARGET, metavar="N",
+                           help="build_seed_queue's total_target for the review batch "
+                                f"(default: {LABEL_TARGET})")
+    p_export.add_argument("--out", required=True, metavar="FILE")
+    p_export.set_defaults(func=cmd_export)
+
+    p_import = sub.add_parser(
+        "import-labels", help="Import labels exported from a portable labeling surface")
+    p_import.add_argument("file", metavar="FILE")
+    p_import.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
+    p_import.set_defaults(func=cmd_import_labels)
+
+    args = parser.parse_args()
+    args.func(args)
 
 
 if __name__ == "__main__":
