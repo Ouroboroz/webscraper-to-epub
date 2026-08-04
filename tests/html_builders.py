@@ -36,6 +36,25 @@ def nu_search_html(hits):
     return f"<ul>{items}</ul>0"
 
 
+def nu_listing_html(entries, has_next=True):
+    """entries: list of (title, url) tuples -> a Novel Updates /novelslisting/
+    browse page, shaped to match novelupdates.list_series()'s selectors --
+    confirmed against a real captured page (2026-08-03): each entry is a
+    div.search_main_box_nu containing div.search_body_nu > div.search_title
+    > a; the pagination widget (div.digg_pagination) carries an
+    a.next_page (rel="next") ONLY when a real next page exists -- past NU's
+    real last page, the listing silently repeats the last page's content
+    but that link disappears, which is the actual (reliable) end signal,
+    not an empty page or a 404."""
+    boxes = "".join(
+        f'<div class="search_main_box_nu"><div class="search_body_nu">'
+        f'<div class="search_title"><a href="{url}">{title}</a></div>'
+        f'</div></div>'
+        for title, url in entries)
+    next_link = '<a class="next_page" href="?pg=2" rel="next"> →</a>' if has_next else ""
+    return f'<html><body><div class="digg_pagination">{next_link}</div>{boxes}</body></html>'
+
+
 def nu_series_html(*, title="Test Series", associated_names=None, genres=None, tags=None,
                     author=None, translation_status=None, translation_groups=None,
                     release_frequency=None, rating=None, votes=None):

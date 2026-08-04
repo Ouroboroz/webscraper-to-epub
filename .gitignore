@@ -20,6 +20,9 @@ dataspine.db-shm
 nu_challenge_debug.html
 nu_challenge_debug.png
 
+# Debug dump from a catalog page that kept parsing to zero novels
+dataspine_crawl_debug.html
+
 # SeleniumBase's own runtime lock files (PyAutoGUI/driver-download locks)
 downloaded_files/
 

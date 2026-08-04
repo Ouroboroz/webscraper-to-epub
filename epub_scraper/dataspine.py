@@ -7,11 +7,11 @@ Usage:
   python -m epub_scraper.dataspine crawl [--start-page N] [--pages N]
                                           [--min-chapters N] [--delay SECS]
                                           [--pacing-file FILE] [--refresh] [--db FILE]
-  python -m epub_scraper.dataspine metadata [--limit N] [--delay SECS]
+  python -m epub_scraper.dataspine metadata [--limit N] [--delay SECS] [--workers N]
                                              [--pacing-file FILE] [--db FILE]
   python -m epub_scraper.dataspine enrich [--limit N] [--search-candidates N]
                                            [--delay SECS] [--pacing-file FILE] [--db FILE]
-  python -m epub_scraper.dataspine chapters [--count N] [--limit N] [--delay SECS]
+  python -m epub_scraper.dataspine chapters [--count N] [--limit N] [--delay SECS] [--workers N]
                                              [--pacing-file FILE] [--db FILE]
   python -m epub_scraper.dataspine embed [--limit N] [--model NAME] [--db FILE]
   python -m epub_scraper.dataspine cluster [--umap-dims N] [--min-cluster-size N] [--db FILE]
@@ -54,10 +54,21 @@ same 429-widening behavior (curl_cffi's HTTPError isn't a requests.HTTPError
 subclass, confirmed live -- note_throttle() would silently never match it)
 and keep their own existing ChallengeExpired re-solve logic on top -- one
 persisted pacing.json across the whole pipeline either way.
+
+`metadata`/`chapters` accept --workers to fetch several novels concurrently
+(each request still individually paced through the shared Pacer -- N workers
+approximates Nx one stream's throughput, not one stream firing Nx faster).
+Deliberately NOT offered on `enrich`: Novel Updates already showed sustained
+429s under plain sequential pacing (see _note_nu_throttle's docstring) and
+sits behind an actual Cloudflare challenge, unlike FanMTL -- concurrent
+requests there are far more likely to trip a fresh block (and force another
+slow browser-based re-solve) than to net any real speedup.
 """
 
 import argparse
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from bs4 import BeautifulSoup
@@ -80,16 +91,42 @@ DEFAULT_CHAPTER_SAMPLE_SIZE = 5
 # Bounded re-solves per `enrich` run if the Cloudflare session expires
 # mid-run -- protects against looping forever if solving itself is broken.
 MAX_CHALLENGE_RESOLVES = 2
+# Consecutive 429s (not ChallengeExpired -- a real 429 response, still
+# "solved" as far as the session looks) before proactively re-solving.
+# Confirmed live (2026-08-03): a real enrich run kept getting sustained 429s
+# even after the pacer had already widened all the way to its own
+# MAX_INTERVAL ceiling (pacing.py) -- since the pacer literally cannot back
+# off any further, that's evidence the block is tied to the solved
+# session/cookie's cumulative volume, not just request rate, and no amount
+# of extra waiting at the same interval was ever going to clear it. Shares
+# MAX_CHALLENGE_RESOLVES's budget rather than its own -- both are "give up
+# on this session, get a fresh one" for the same underlying reason.
+MAX_CONSECUTIVE_429S = 5
 # Bounded retries per catalog page in `crawl` before giving up the whole run --
 # a transient error/429/challenge shouldn't kill a multi-hour unattended crawl,
 # but a truly dead site/URL shouldn't retry forever either.
 MAX_PAGE_RETRIES = 5
+# Bounded retries for a catalog page that fetched fine (HTTP 200) but parsed
+# to zero novels, before treating that as real signal rather than a fluke.
+# Confirmed live (2026-08-03): a genuine end-of-catalog page 404s (see
+# _is_permanent_404 above) -- a 200 with zero parsed novels has never been
+# observed as the real end, only as a transient soft-block/rate-limit. Not
+# retrying this cost ~1,400 pages (~42,000 novels) of a real crawl, twice:
+# page ~3810 and then page 3909 both parsed to zero once, got taken at face
+# value as "the end", and the run stopped there even though the catalog
+# actually continues to page 5323.
+MAX_EMPTY_PAGE_RETRIES = 3
 
 
 def _session():
     session = requests.Session()
     session.headers.update(HEADERS)
     return session
+
+
+def _format_elapsed(seconds):
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes:02d}m{secs:02d}s"
 
 
 def _is_permanent_404(e):
@@ -142,6 +179,77 @@ def _fetch_page_with_retry(url, session, pacer, site_key, max_retries=MAX_PAGE_R
             time.sleep(gap)
 
 
+def _dump_crawl_debug(html):
+    """Best-effort page-source dump when a catalog page keeps parsing to
+    zero novels after retrying -- since the real end-of-catalog signal is a
+    404, not this, that means either a soft block/rate-limit or a broken
+    catalog-page selector, and a concrete artifact beats guessing which.
+    Written to the current directory -- gitignored, not meant to be
+    committed."""
+    try:
+        with open("dataspine_crawl_debug.html", "w", encoding="utf-8") as f:
+            f.write(html or "")
+        print("  wrote dataspine_crawl_debug.html for inspection")
+    except OSError as e:
+        print(f"  (failed to write dataspine_crawl_debug.html: {e})")
+
+
+def _retry_empty_page(url, session, pacer, page, max_retries=MAX_EMPTY_PAGE_RETRIES):
+    """Re-fetch and re-parse a catalog page that just parsed to zero novels,
+    up to max_retries times (with the pacer's normal backoff gap between
+    attempts). Returns (entries, last_html_seen) -- entries is [] if it
+    never recovered. Can raise (a permanent 404 mid-retry propagates
+    straight to the caller, same as a first-attempt 404 would)."""
+    html = None
+    for attempt in range(1, max_retries + 1):
+        gap = pacer.gap(SITE_KEY)
+        print(f"  page {page} parsed to zero novels; retry {attempt}/{max_retries} "
+              f"after {gap:.1f}s...")
+        time.sleep(gap)
+        html = _fetch_page_with_retry(url, session, pacer, SITE_KEY)
+        entries = parse_fanmtl_catalog_page(html)
+        if entries:
+            return entries, html
+    return [], html
+
+
+def _run_concurrent(rows, worker_fn, workers, pacer, site_key):
+    """Call `worker_fn(row)` for each row using `workers` threads, each call
+    preceded by a locked pacer.gap() sleep -- Pacer.gap() draws from the
+    shared `random` module and (via throttled(), called back on the main
+    thread below, not here) mutates self.intervals/rewrites pacing.json, so
+    concurrent unlocked callers could race. `workers` streams at a per-
+    stream `gap()` pace approximates `workers`x the throughput of one
+    sequential stream while every individual request is still paced the
+    same as before -- not one stream firing `workers`x faster.
+
+    worker_fn must do network I/O + pure-Python parsing ONLY, no DB access:
+    sqlite3 connections are thread-affine (same reasoning as labeling.py's
+    build_app() docstring), so all DB writes happen back on the caller,
+    single-threaded, as it consumes what this yields.
+
+    Yields (row, result) in COMPLETION order (not input order) -- result is
+    whatever worker_fn returned, or the exception it raised (never re-raised
+    here, so the caller can handle it exactly like the sequential path's
+    try/except does).
+    """
+    lock = threading.Lock()
+
+    def _paced_call(row):
+        with lock:
+            gap = pacer.gap(site_key)
+        time.sleep(gap)
+        try:
+            return worker_fn(row)
+        except Exception as e:
+            return e
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_paced_call, row): row for row in rows}
+        for future in as_completed(futures):
+            yield futures[future], future.result()
+
+
 def cmd_crawl(args):
     conn = init_db(args.db)
     session = _session()
@@ -157,6 +265,9 @@ def cmd_crawl(args):
         url = CATALOG_URL_TEMPLATE.format(page=page)
         try:
             html = _fetch_page_with_retry(url, session, pacer, SITE_KEY)
+            entries = parse_fanmtl_catalog_page(html)
+            if not entries:
+                entries, html = _retry_empty_page(url, session, pacer, page)
         except Exception as e:
             if _is_permanent_404(e):
                 print(f"Page {page} returned 404 -- reached the current end of the catalog. "
@@ -168,9 +279,12 @@ def cmd_crawl(args):
             conn.commit()
             break
 
-        entries = parse_fanmtl_catalog_page(html)
         if not entries:
-            print(f"Page {page} had no novels -- reached the end of the catalog.")
+            print(f"Page {page} still parsed to zero novels after {MAX_EMPTY_PAGE_RETRIES} "
+                  f"retries -- NOT treating this as the end (a real end-of-catalog page 404s "
+                  f"here, not this). Looks like a soft block/rate-limit or a broken selector. "
+                  f"Stopping without advancing past page {page} so the next run retries here.")
+            _dump_crawl_debug(html)
             set_next_page(conn, SITE_KEY, page)
             conn.commit()
             break
@@ -193,7 +307,7 @@ def cmd_crawl(args):
         rate = pages_fetched / elapsed * 60 if elapsed > 0 else 0.0
         print(f"[page {page - 1}] {len(entries)} novels  "
               f"({new_or_updated} new/updated, {skipped} skipped so far, "
-              f"{elapsed / 60:.1f}m elapsed, ~{rate:.1f} pages/min)")
+              f"{_format_elapsed(elapsed)} elapsed, ~{rate:.1f} pages/min)")
 
         if args.pages is None or pages_fetched < args.pages:
             time.sleep(pacer.gap(SITE_KEY))
@@ -208,6 +322,21 @@ def cmd_crawl(args):
           f"{summary['candidates']} / {summary['total']} catalogued")
 
 
+def _handle_metadata_result(conn, pacer, i, total, started_at, row, result):
+    elapsed = time.monotonic() - started_at
+    if isinstance(result, Exception):
+        note_throttle(pacer, SITE_KEY, result)
+        print(f"[{i}/{total}] error on {row['title']!r}: {result}")
+        return
+    metadata = parse_fanmtl_metadata(result)
+    upsert_metadata(conn, SITE_KEY, row["url"], metadata)
+    conn.commit()
+    synopsis_status = "ok" if metadata.synopsis else "MISSING"
+    print(f"[{i}/{total}] {row['title']!r}  "
+          f"({len(metadata.genres)} genres, synopsis {synopsis_status}, "
+          f"{_format_elapsed(elapsed)} elapsed)")
+
+
 def cmd_metadata(args):
     conn = init_db(args.db)
     session = _session()
@@ -218,24 +347,23 @@ def cmd_metadata(args):
         print("No candidates pending a metadata fetch.")
         return
 
+    total = len(rows)
     started_at = time.monotonic()
-    for i, row in enumerate(rows):
-        try:
-            html = fetch(row["url"], session)
-            metadata = parse_fanmtl_metadata(html)
-            upsert_metadata(conn, SITE_KEY, row["url"], metadata)
-            conn.commit()
-            synopsis_status = "ok" if metadata.synopsis else "MISSING"
-            elapsed = time.monotonic() - started_at
-            print(f"[{i + 1}/{len(rows)}] {row['title']!r}  "
-                  f"({len(metadata.genres)} genres, synopsis {synopsis_status}, "
-                  f"{elapsed / 60:.1f}m elapsed)")
-        except Exception as e:
-            note_throttle(pacer, SITE_KEY, e)
-            print(f"[{i + 1}/{len(rows)}] error on {row['title']!r}: {e}")
 
-        if i < len(rows) - 1:
-            time.sleep(pacer.gap(SITE_KEY))
+    if args.workers <= 1:
+        for i, row in enumerate(rows, start=1):
+            try:
+                result = fetch(row["url"], session)
+            except Exception as e:
+                result = e
+            _handle_metadata_result(conn, pacer, i, total, started_at, row, result)
+            if i < total:
+                time.sleep(pacer.gap(SITE_KEY))
+    else:
+        worker_fn = lambda row: fetch(row["url"], session)  # noqa: E731 -- closes over `session`
+        for i, (row, result) in enumerate(
+                _run_concurrent(rows, worker_fn, args.workers, pacer, SITE_KEY), start=1):
+            _handle_metadata_result(conn, pacer, i, total, started_at, row, result)
 
 
 def _resolve_one(session, row, search_candidates):
@@ -273,6 +401,7 @@ def cmd_enrich(args):
         return
 
     resolves_left = MAX_CHALLENGE_RESOLVES
+    consecutive_429s = 0
     started_at = time.monotonic()
     for i, row in enumerate(rows):
         try:
@@ -284,6 +413,7 @@ def cmd_enrich(args):
             print("  session expired -- re-solving the challenge...")
             session = novelupdates.solve_challenge_session()
             resolves_left -= 1
+            consecutive_429s = 0
             try:
                 resolution, matched = _resolve_one(session, row, args.search_candidates)
             except novelupdates.ChallengeExpired:
@@ -291,17 +421,32 @@ def cmd_enrich(args):
                       f"{row['title']!r}, skipping for this run")
                 continue
         except Exception as e:
-            _note_nu_throttle(pacer, e)
+            was_429 = _note_nu_throttle(pacer, e)
             print(f"[{i + 1}/{len(rows)}] error resolving {row['title']!r}: {e}")
+            if not was_429:
+                continue
+            consecutive_429s += 1
+            if consecutive_429s < MAX_CONSECUTIVE_429S:
+                continue
+            if resolves_left <= 0:
+                print("Sustained 429s and challenge re-solve budget exhausted -- "
+                      "stopping this run.")
+                break
+            print(f"  {consecutive_429s} consecutive 429s despite max pacing -- the session "
+                  f"looks exhausted, not just rate-limited. Re-solving with a fresh one...")
+            session = novelupdates.solve_challenge_session()
+            resolves_left -= 1
+            consecutive_429s = 0
             continue
 
+        consecutive_429s = 0
         upsert_nu_metadata(conn, SITE_KEY, row["url"], resolution.decision, matched)
         conn.commit()
 
         detail = f" -- {matched.title!r}" if matched is not None else ""
         elapsed = time.monotonic() - started_at
         print(f"[{i + 1}/{len(rows)}] {row['title']!r} -> {resolution.decision}{detail}  "
-              f"({elapsed / 60:.1f}m elapsed)")
+              f"({_format_elapsed(elapsed)} elapsed)")
 
         if i < len(rows) - 1:
             time.sleep(pacer.gap(NU_SITE_KEY))
@@ -316,6 +461,24 @@ def _plain_text_from_chapter_body(body_html):
     return "\n\n".join(paragraphs)
 
 
+def _handle_chapters_result(conn, pacer, i, total, started_at, args, row, result):
+    elapsed = time.monotonic() - started_at
+    if isinstance(result, Exception):
+        note_throttle(pacer, SITE_KEY, result)
+        print(f"[{i}/{total}] error on {row['title']!r}: {result}")
+        return
+    fetched, failed_ns = result
+    chapter_range = range(1, args.count + 1)
+    successful_ns = [n for n in chapter_range if n not in failed_ns]
+    upsert_chapters(conn, row["id"], [
+        (n, title, _plain_text_from_chapter_body(body))
+        for n, (title, body) in zip(successful_ns, fetched)
+    ])
+    conn.commit()
+    print(f"[{i}/{total}] {row['title']!r}  "
+          f"({len(fetched)}/{args.count} chapters, {_format_elapsed(elapsed)} elapsed)")
+
+
 def cmd_chapters(args):
     conn = init_db(args.db)
     session = _session()
@@ -327,27 +490,37 @@ def cmd_chapters(args):
         return
 
     chapter_range = range(1, args.count + 1)
-    started_at = time.monotonic()
-    for i, row in enumerate(rows):
-        try:
-            fetched, failed_ns, _ = scrape_chapters(
-                PROFILE, session, FANMTL_BASE_URL, row["chapter_id"], chapter_range,
-                cache_dir=args.cache_dir, delay=args.delay, pacer=pacer)
-            successful_ns = [n for n in chapter_range if n not in failed_ns]
-            upsert_chapters(conn, row["id"], [
-                (n, title, _plain_text_from_chapter_body(body))
-                for n, (title, body) in zip(successful_ns, fetched)
-            ])
-            conn.commit()
-            elapsed = time.monotonic() - started_at
-            print(f"[{i + 1}/{len(rows)}] {row['title']!r}  "
-                  f"({len(fetched)}/{args.count} chapters, {elapsed / 60:.1f}m elapsed)")
-        except Exception as e:
-            note_throttle(pacer, SITE_KEY, e)
-            print(f"[{i + 1}/{len(rows)}] error on {row['title']!r}: {e}")
 
-        if i < len(rows) - 1:
-            time.sleep(pacer.gap(SITE_KEY))
+    def _sample_one(row):
+        fetched, failed_ns, _ = scrape_chapters(
+            PROFILE, session, FANMTL_BASE_URL, row["chapter_id"], chapter_range,
+            cache_dir=args.cache_dir, delay=args.delay, pacer=pacer)
+        return fetched, failed_ns
+
+    total = len(rows)
+    started_at = time.monotonic()
+
+    if args.workers <= 1:
+        for i, row in enumerate(rows, start=1):
+            try:
+                result = _sample_one(row)
+            except Exception as e:
+                result = e
+            _handle_chapters_result(conn, pacer, i, total, started_at, args, row, result)
+            if i < total:
+                time.sleep(pacer.gap(SITE_KEY))
+    else:
+        # scrape_chapters() paces its own OWN inner per-chapter loop via this
+        # same `pacer` without a lock (unchanged, shared code with the
+        # interactive EPUB-download CLI -- not touching its internals here).
+        # Only the per-NOVEL stagger below (when each worker's scrape_chapters
+        # call *starts*) goes through _run_concurrent's locked gap() -- the
+        # occasional unlocked race inside one novel's own 5-chapter fetch is
+        # the same "corrupt pacing.json is never fatal, just re-learned"
+        # tolerance Pacer.load() already documents, not a new risk class.
+        for i, (row, result) in enumerate(
+                _run_concurrent(rows, _sample_one, args.workers, pacer, SITE_KEY), start=1):
+            _handle_chapters_result(conn, pacer, i, total, started_at, args, row, result)
 
 
 def cmd_embed(args):
@@ -437,6 +610,10 @@ def build_parser():
     p_metadata = sub.add_parser("metadata", help="Fetch full metadata for candidates missing it")
     p_metadata.add_argument("--limit", type=int, default=50, metavar="N")
     p_metadata.add_argument("--delay", type=float, default=2.5, metavar="SECS")
+    p_metadata.add_argument("--workers", type=int, default=1, metavar="N",
+                             help="Concurrent fetches (default: 1, sequential). FanMTL has no "
+                                  "known Cloudflare-style challenge, unlike Novel Updates, so "
+                                  "this is reasonable to raise (e.g. 5-10) here.")
     p_metadata.add_argument("--pacing-file", default=DEFAULT_PACING_PATH, metavar="FILE")
     p_metadata.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
     p_metadata.set_defaults(func=cmd_metadata)
@@ -456,6 +633,9 @@ def build_parser():
                                   f"{DEFAULT_CHAPTER_SAMPLE_SIZE})")
     p_chapters.add_argument("--limit", type=int, default=20, metavar="N")
     p_chapters.add_argument("--delay", type=float, default=2.5, metavar="SECS")
+    p_chapters.add_argument("--workers", type=int, default=1, metavar="N",
+                             help="Concurrent novels sampled at once (default: 1, sequential). "
+                                  "Same FanMTL-only reasoning as `metadata --workers`.")
     p_chapters.add_argument("--pacing-file", default=DEFAULT_PACING_PATH, metavar="FILE")
     p_chapters.add_argument("--cache-dir", default=".cache", metavar="DIR",
                              help="Shared with the interactive EPUB-download pipeline's chapter "
