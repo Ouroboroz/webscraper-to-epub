@@ -187,10 +187,11 @@ same on-disk `.cache/` as the interactive scraper, so a chapter sampled here is 
 that novel later gets a full download).
 
 **Setup**: the `crawl`/`metadata`/`chapters` commands need nothing beyond `requirements.txt`.
-`enrich` also needs `requirements-novelupdates.txt` (SeleniumBase + curl_cffi, and a real Chrome —
-on Linux, an Xvfb display too — since it solves Novel Updates' Cloudflare challenge with an actual
-browser). Verify that part in isolation first with `python -m epub_scraper.novelupdates check`
-before trusting a full `enrich` run.
+`nu-crawl`/`nu-metadata` also need `requirements-novelupdates.txt` (SeleniumBase + curl_cffi, and a
+real Chrome — on Linux, an Xvfb display too — since they solve Novel Updates' Cloudflare challenge
+with an actual browser). Verify that part in isolation first with
+`python -m epub_scraper.novelupdates check` before trusting a full `nu-metadata` run. `enrich`
+itself needs neither — see below.
 
 ```
 pip install -r requirements-novelupdates.txt
@@ -201,8 +202,18 @@ pip install -r requirements-novelupdates.txt
 | `crawl [--start-page N] [--pages N] [--min-chapters N] [--delay SECS] [--pacing-file FILE] [--refresh] [--db FILE]` | Page through the catalog listing, upsert every novel, and flag candidates (`chapter_count >= --min-chapters`) |
 | `metadata [--limit N] [--delay SECS] [--pacing-file FILE] [--db FILE]` | Fetch full synopsis/genres/author/alt-title for each candidate still missing it |
 | `chapters [--count N] [--limit N] [--delay SECS] [--pacing-file FILE] [--cache-dir DIR] [--db FILE]` | Sample each candidate's first `--count` chapters (default 5) as clean plain text |
-| `enrich [--limit N] [--search-candidates N] [--delay SECS] [--pacing-file FILE] [--db FILE]` | Resolve each candidate against Novel Updates (tags, author, translation status, rating) |
-| `stats [--db FILE]` | Progress summary: totals, candidates, how many have metadata/chapters, NU-resolution breakdown |
+| `nu-crawl [--start-page N] [--pages N] [--delay SECS] [--pacing-file FILE] [--db FILE]` | Page through Novel Updates' own bulk catalog listing into `nu_novels` (url+title only; short, ~100 pages total) |
+| `nu-metadata [--limit N] [--delay SECS] [--pacing-file FILE] [--db FILE]` | Fetch each `nu_novels` row's full detail (synopsis/genres/tags/author/status/...) |
+| `enrich [--limit N] [--db FILE]` | Match each pending FanMTL candidate against the locally-crawled `nu_novels` catalog — pure computation, no network |
+| `stats [--db FILE]` | Progress summary: totals, candidates, how many have metadata/chapters, NU-resolution breakdown, `nu_novels` progress |
+
+**Why `nu-crawl`/`nu-metadata`/`enrich` instead of one `enrich` that searches Novel Updates
+per-candidate (the original design)**: real-world testing (2026-08-03) found Novel Updates' entire
+catalog is only ~2,475 series total — tiny next to the FanMTL candidate pool (up to 105,049), so a
+live search per candidate was guaranteed to come back empty for the vast majority of them (>95%),
+against a site 40x smaller than what was being searched. `nu-crawl` + `nu-metadata` crawl NU's own
+catalog into `nu_novels` once (independent of any FanMTL data); `enrich` then matches locally
+against that fixed set — no Novel Updates network traffic on `enrich`'s critical path at all.
 
 **Running the full pipeline** — run in this order (each stage reads what the previous one wrote).
 `--min-chapters 300` and `--delay 1.2` are the settings actually chosen for this project (see
@@ -217,25 +228,32 @@ source ~/miniconda3/etc/profile.d/conda.sh && conda activate epub   # or your ow
 python -m epub_scraper.dataspine crawl --min-chapters 300 --pages 100000 --delay 1.2 --db dataspine.db
 python -m epub_scraper.dataspine metadata --limit 1000000 --delay 1.2 --db dataspine.db
 python -m epub_scraper.dataspine chapters --limit 1000000 --delay 1.2 --db dataspine.db
-python -m epub_scraper.dataspine enrich --limit 1000000 --delay 1.2 --db dataspine.db
+python -m epub_scraper.dataspine nu-crawl --delay 1.2 --db dataspine.db
+python -m epub_scraper.dataspine nu-metadata --limit 1000000 --delay 1.2 --db dataspine.db
+python -m epub_scraper.dataspine enrich --db dataspine.db
 
 python -m epub_scraper.dataspine stats --db dataspine.db
 ```
 
 `--pages 100000`/`--limit 1000000` aren't real expected totals — they're just "don't stop early,"
-since `crawl` already stops on its own at the first empty page (end of catalog) and
-`metadata`/`chapters`/`enrich` already stop on their own once nothing is left pending; the
-defaults (10/50/20/20) exist so a first-time run doesn't run away unbounded, not because a real
-run should be split into many small invocations.
+since `crawl` already stops on its own at the first empty page (end of catalog), `nu-crawl` stops
+on its own once Novel Updates' own pagination runs out, and `metadata`/`chapters`/`nu-metadata`/
+`enrich` already stop on their own once nothing is left pending; the defaults exist so a first-time
+run doesn't run away unbounded, not because a real run should be split into many small invocations
+(`enrich`'s own default is already a large number, since it's pure local computation now with
+nothing left to be cautious about).
 
-**Resumable and paced like the rest of this repo**: `crawl`'s next page is persisted in the DB
-itself (`crawl_state` table) after every page, so re-running it with no `--start-page` just
-continues — pass `--start-page` explicitly only to override that. `metadata`/`chapters`/`enrich`
-are naturally resumable too (each just queries for candidates still missing that stage's data). All
-four share one `pacing.json` (via `--pacing-file`) with the interactive scraper's `Pacer` — a 429 or
-detected challenge page widens the interval and it never resets on its own; delete `pacing.json`
-to reset. `crawl` additionally retries a failed page (bounded, 5x) with backoff before giving up,
-rather than letting one transient error kill an unattended multi-hour run.
+**Resumable and paced like the rest of this repo**: `crawl`/`nu-crawl`'s next page is persisted in
+the DB itself (`crawl_state` table, keyed by site) after every page, so re-running either with no
+`--start-page` just continues — pass `--start-page` explicitly only to override that.
+`metadata`/`chapters`/`nu-metadata` are naturally resumable too (each just queries for rows still
+missing that stage's data); `enrich` likewise only processes FanMTL candidates still missing a
+resolution. `crawl`/`metadata`/`chapters`/`nu-crawl`/`nu-metadata` share one `pacing.json` (via
+`--pacing-file`) with the interactive scraper's `Pacer` — a 429 or detected challenge page widens
+the interval and it never resets on its own; delete `pacing.json` to reset. `crawl` additionally
+retries a failed page (bounded, 5x) with backoff before giving up, rather than letting one
+transient error kill an unattended multi-hour run; `nu-metadata` similarly forces a fresh Novel
+Updates session after 3 sustained back-to-back 429s, on top of the pacer widening.
 
 **Running it unattended, logged, tailable**:
 
@@ -243,10 +261,12 @@ rather than letting one transient error kill an unattended multi-hour run.
 mkdir -p logs
 export PYTHONUNBUFFERED=1   # otherwise stdout is block-buffered when redirected to a file,
                              # and `tail -f` won't show anything until the buffer fills
-python -m epub_scraper.dataspine crawl    --min-chapters 300 --pages 100000  --delay 1.2 --db dataspine.db >> logs/dataspine_crawl.log 2>&1
-python -m epub_scraper.dataspine metadata --limit 1000000     --delay 1.2 --db dataspine.db >> logs/dataspine_crawl.log 2>&1
-python -m epub_scraper.dataspine chapters --limit 1000000     --delay 1.2 --db dataspine.db >> logs/dataspine_crawl.log 2>&1
-python -m epub_scraper.dataspine enrich   --limit 1000000     --delay 1.2 --db dataspine.db >> logs/dataspine_crawl.log 2>&1
+python -m epub_scraper.dataspine crawl      --min-chapters 300 --pages 100000  --delay 1.2 --db dataspine.db >> logs/dataspine_crawl.log 2>&1
+python -m epub_scraper.dataspine metadata   --limit 1000000     --delay 1.2 --db dataspine.db >> logs/dataspine_crawl.log 2>&1
+python -m epub_scraper.dataspine chapters   --limit 1000000     --delay 1.2 --db dataspine.db >> logs/dataspine_crawl.log 2>&1
+python -m epub_scraper.dataspine nu-crawl                        --delay 1.2 --db dataspine.db >> logs/dataspine_crawl.log 2>&1
+python -m epub_scraper.dataspine nu-metadata --limit 1000000     --delay 1.2 --db dataspine.db >> logs/dataspine_crawl.log 2>&1
+python -m epub_scraper.dataspine enrich     --db dataspine.db >> logs/dataspine_crawl.log 2>&1
 ```
 
 then in another shell: `tail -f logs/dataspine_crawl.log`.
@@ -285,10 +305,10 @@ python -m epub_scraper.dataspine tag-communities --db dataspine.db
 
 `embed` only needs `synopsis` (from `metadata`), not `chapters` or a finished `enrich` run — it's
 usable as soon as `metadata` has processed anything, and just gets a richer tag graph as `enrich`
-continues in the background. Unlike `crawl`/`metadata`/`chapters`/`enrich`, `cluster` and
-`tag-communities` are **full recomputes** every time, not incremental — a cluster boundary can
-shift for every novel as the corpus grows, so there's no meaningful "resume" for them; just
-re-run them after `embed` has processed more candidates.
+continues in the background. Unlike `crawl`/`metadata`/`chapters`/`nu-crawl`/`nu-metadata`/`enrich`,
+`cluster` and `tag-communities` are **full recomputes** every time, not incremental — a cluster
+boundary can shift for every novel as the corpus grows, so there's no meaningful "resume" for them;
+just re-run them after `embed` has processed more candidates.
 
 Verified live (2026-08-03) against 1,510 real novels: embedded in ~46s on a consumer GPU, 14
 clusters + 786 outliers, and the clusters are genuinely thematically coherent (clean separation by
@@ -351,11 +371,12 @@ epub_scraper/
   fetcher.py      HTTP fetch with shared headers
   sites/          one SiteProfile per supported aggregator site
   tools/          standalone helpers (e.g. fetch_sample.py) for site onboarding
-  dataspine.py       Stage 0/1 CLI (crawl/metadata/chapters/enrich/embed/cluster/
-                     tag-communities/stats) -- see "Classification Data Spine" and
-                     "Corpus structure" sections above
+  dataspine.py       Stage 0/1 CLI (crawl/metadata/chapters/nu-crawl/nu-metadata/
+                     enrich/embed/cluster/tag-communities/stats) -- see
+                     "Classification Data Spine" and "Corpus structure" sections above
   dataspine_db.py    SQLite schema + helpers for dataspine.py
-  novelupdates.py    Novel Updates challenge-solving, search, series-page scraping
+  novelupdates.py    Novel Updates challenge-solving, catalog listing, search,
+                     series-page scraping (synopsis included)
   entity_resolution.py  FanMTL <-> Novel Updates title matching (RapidFuzz cascade)
   corpus_structure.py    Stage 1: synopsis embedding, UMAP+HDBSCAN clustering,
                          tag-community detection (Leiden) -- pure local computation

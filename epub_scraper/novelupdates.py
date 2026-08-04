@@ -1,6 +1,19 @@
 """
-epub_scraper.novelupdates — Novel Updates (NU) enrichment: search by title,
-fetch a series page's associated names/tags/author/status.
+epub_scraper.novelupdates — Novel Updates (NU) enrichment: crawl NU's own
+bulk catalog listing, fetch a series page's associated names/tags/author/
+status/synopsis, and (still available, but no longer used by dataspine.py's
+`enrich` -- see below) search by title.
+
+**2026-08-03 finding that changed how this module is used**: NU's entire
+catalog turned out to be only ~2,475 series total (see list_series() below)
+-- tiny next to the FanMTL candidate pool (up to 105,049) that dataspine.py's
+old `enrich` used to live-search against it one candidate at a time, meaning
+>95% of those searches were guaranteed to come back empty against a site 40x
+smaller than what was being searched. Fixed by crawling NU's own catalog
+into `nu_novels` once (`nu-crawl` + `nu-metadata` in dataspine.py) and
+matching locally instead (`enrich`, now pure computation, no network). search()
+is kept working and tested since it's still a reasonable ad-hoc lookup (see
+`novelupdates check`), just no longer on the hot path of the main pipeline.
 
 NU sits behind a live Cloudflare Managed Challenge. Series-page selectors
 were originally grounded only in two independent open-source NU scrapers'
@@ -60,6 +73,11 @@ class NUSeriesMetadata(NamedTuple):
     release_frequency: Optional[str]
     rating: Optional[str]
     votes: Optional[str]
+    # Added after the initial fields shipped -- default keeps every existing
+    # keyword-args construction site (tests included) working unchanged.
+    # Not wired into the FanMTL `novels` row (see dataspine.py's cmd_enrich
+    # docstring) -- Stage 8 reads it straight off nu_novels.synopsis instead.
+    synopsis: Optional[str] = None
 
 
 class ChallengeExpired(Exception):
@@ -275,6 +293,21 @@ def _rating_and_votes(soup):
     return None, None
 
 
+def _synopsis_from_div(div):
+    """Mirrors epub_scraper/sites/fanmtl.py's parse_fanmtl_metadata() synopsis
+    extraction, for consistency between the two sites' scrapers: join every
+    non-empty <p>'s text with a blank line between paragraphs, falling back
+    to the div's own text if it has no <p> children at all."""
+    if div is None:
+        return None
+    paragraphs = [p.get_text(strip=True) for p in div.select("p")]
+    paragraphs = [p for p in paragraphs if p]
+    if paragraphs:
+        return "\n\n".join(paragraphs)
+    text = div.get_text(strip=True)
+    return text or None
+
+
 def fetch_series(session, url):
     """Fetch and parse one NU series page.
 
@@ -284,6 +317,12 @@ def fetch_series(session, url):
     (the one real page checked -- Reverend Insanity -- is an officially
     licensed release with no fan-translation groups to test against;
     selector kept as the reference scraper had it, low confidence).
+
+    synopsis (added 2026-08-03, confirmed live against a real captured page
+    -- Reverend Insanity again): div#editdescription holds one <p> per
+    synopsis paragraph -- same shape as FanMTL's own synopsis div, see
+    _synopsis_from_div() above. Not extracted before this -- a real gap,
+    since Stage 8 (tag/synopsis classification) will want it.
 
     translation_status reads div#editstatus ("Status in Country of Origin"
     -- e.g. "2334 Chapters (Cancelled/Banned)"), not div#showtranslated
@@ -321,6 +360,7 @@ def fetch_series(session, url):
     ]
 
     rating, votes = _rating_and_votes(soup)
+    synopsis = _synopsis_from_div(soup.select_one("div#editdescription"))
 
     return NUSeriesMetadata(
         url=url, title=title, associated_names=associated_names, genres=genres, tags=tags,
@@ -329,7 +369,50 @@ def fetch_series(session, url):
         release_frequency=_release_frequency(soup),
         rating=rating,
         votes=votes,
+        synopsis=synopsis,
     )
+
+
+def list_series(session, page):
+    """Fetch one page of Novel Updates' own bulk catalog listing -- ALL of
+    NU's series, independent of any search query -- for the local `nu-crawl`
+    pipeline (see dataspine.py's cmd_nu_crawl docstring for why this exists:
+    NU's entire catalog turned out to be only ~2,475 series, far smaller than
+    the FanMTL candidate pool that used to be searched against it one at a
+    time). Returns (hits, has_next).
+
+    URL: {BASE_URL}/novelslisting/?st=1&pg=<page> -- page starts at 1, not 0.
+    Confirmed live (2026-08-03): 25 entries/page, each at
+    `div.search_main_box_nu div.search_title a` (title text + series URL --
+    nothing else needed at listing time; full detail is fetch_series()'s job,
+    called later per-series by `nu-metadata`).
+
+    Real end-of-list signal (NOT a 404): also confirmed live (2026-08-03)
+    that fetching past the catalog's real last page silently clamps/repeats
+    that last page's content rather than erroring -- pages 100 through 10000
+    all returned page 99's identical entries on the day this was checked (the
+    real last-page number grows over time as NU adds series -- never
+    hardcode it). The only reliable stop signal is the pagination widget
+    itself: `div.digg_pagination` contains `<a class="next_page" ...
+    rel="next">` only when a genuine next page exists (present on page 99,
+    absent on the clamped page 100 that same day). So: has_next=False means
+    stop, regardless of how many hits this page's soup contained."""
+    r = session.get(f"{BASE_URL}/novelslisting/", params={"st": 1, "pg": page}, timeout=20)
+    r.raise_for_status()
+    if looks_like_challenge_page(r.text):
+        raise ChallengeExpired(f"Challenge page returned for novelslisting page {page}")
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    hits = []
+    for link in soup.select("div.search_main_box_nu div.search_title a"):
+        href = link.get("href")
+        title = link.get_text(strip=True)
+        if not href or not title:
+            continue
+        hits.append(NUSearchHit(title=title, url=urljoin(BASE_URL, href)))
+
+    has_next = soup.select_one("div.digg_pagination a.next_page") is not None
+    return hits, has_next
 
 
 def find_nu_candidates(session, query, limit=10):
@@ -350,6 +433,7 @@ def _print_series(metadata):
     print(f"Translation groups: {metadata.translation_groups}")
     print(f"Release frequency : {metadata.release_frequency}")
     print(f"Rating / votes    : {metadata.rating} / {metadata.votes}")
+    print(f"Synopsis          : {(metadata.synopsis or '')[:200]!r}")
 
 
 def cmd_check(args):

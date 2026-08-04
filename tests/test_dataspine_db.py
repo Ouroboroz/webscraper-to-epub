@@ -1,17 +1,21 @@
 import pytest
 
-from epub_scraper.dataspine_db import (all_tags, count_labels, delete_most_recent_label,
-                                        first_chapter_excerpt, get_next_page, get_novel,
-                                        get_novel_by_id, init_db, iter_candidates_missing_chapters,
+from epub_scraper.dataspine_db import (all_resolved_nu_novels, all_tags, count_labels,
+                                        delete_most_recent_label, first_chapter_excerpt,
+                                        get_next_page, get_novel, get_novel_by_id, get_nu_novel,
+                                        init_db, iter_candidates_missing_chapters,
                                         iter_candidates_missing_embedding,
                                         iter_candidates_missing_metadata,
                                         iter_candidates_missing_nu_resolution, iter_embeddings,
-                                        iter_labeled_novel_ids, iter_tag_cooccurrence,
-                                        label_counts_by_type, recompute_candidates, set_next_page,
+                                        iter_labeled_novel_ids, iter_nu_novels_missing_details,
+                                        iter_tag_cooccurrence, label_counts_by_type,
+                                        recompute_candidates, set_next_page, split_comma_list,
                                         stats, tags_for_novel, upsert_catalog_entry,
                                         upsert_chapters, upsert_embedding, upsert_label,
                                         upsert_metadata, upsert_nu_metadata,
+                                        upsert_nu_novel_details, upsert_nu_novel_listing,
                                         write_cluster_assignments, write_tag_communities)
+from epub_scraper.entity_resolution import NUCandidate
 from epub_scraper.novelupdates import NUSeriesMetadata
 from epub_scraper.profile import CatalogEntry, MetadataResult
 
@@ -246,6 +250,142 @@ def test_set_next_page_is_per_site(db_path):
     conn.commit()
     assert get_next_page(conn, "other_site") == 0
     assert get_next_page(conn, "fanmtl") == 5
+
+
+# -- Novel Updates' own catalog (nu_novels) --------------------------------------
+
+def make_nu_metadata(url, **overrides):
+    fields = dict(
+        url=url, title="A Series", associated_names=["A Series", "Alt Name"],
+        genres=["Fantasy"], tags=["Reincarnation"], author="Some Author",
+        translation_status="Ongoing", translation_groups=["Group One", "Group Two"],
+        release_frequency="1/week", rating="4.5", votes="200", synopsis="A synopsis.",
+    )
+    fields.update(overrides)
+    return NUSeriesMetadata(**fields)
+
+
+def test_upsert_nu_novel_listing_then_missing_details(db_path):
+    conn = init_db(db_path)
+    upsert_nu_novel_listing(conn, "https://nu/series/a/", "A Series")
+    conn.commit()
+
+    pending = iter_nu_novels_missing_details(conn)
+    assert len(pending) == 1
+    assert pending[0]["url"] == "https://nu/series/a/"
+    assert pending[0]["title"] == "A Series"
+    assert pending[0]["fetched_at"] is None
+
+
+def test_upsert_nu_novel_listing_is_idempotent_upsert_on_title(db_path):
+    conn = init_db(db_path)
+    upsert_nu_novel_listing(conn, "https://nu/series/a/", "Old Title")
+    conn.commit()
+    upsert_nu_novel_listing(conn, "https://nu/series/a/", "New Title")
+    conn.commit()
+
+    rows = conn.execute("SELECT * FROM nu_novels").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["title"] == "New Title"
+
+
+def test_upsert_nu_novel_listing_never_touches_fetched_at_or_details(db_path):
+    # Re-crawling the listing (e.g. NU renamed a series) must not reset a
+    # novel already past its detail fetch back to pending.
+    conn = init_db(db_path)
+    upsert_nu_novel_listing(conn, "https://nu/series/a/", "A Series")
+    conn.commit()
+    upsert_nu_novel_details(conn, "https://nu/series/a/", make_nu_metadata("https://nu/series/a/"))
+    conn.commit()
+
+    upsert_nu_novel_listing(conn, "https://nu/series/a/", "A Series (renamed)")
+    conn.commit()
+
+    row = get_nu_novel(conn, "https://nu/series/a/")
+    assert row["title"] == "A Series (renamed)"
+    assert row["fetched_at"] is not None  # untouched
+    assert row["genres"] == "Fantasy"  # untouched
+    assert iter_nu_novels_missing_details(conn) == []
+
+
+def test_upsert_nu_novel_details_fills_in_fields_and_stamps_fetched_at(db_path):
+    conn = init_db(db_path)
+    upsert_nu_novel_listing(conn, "https://nu/series/a/", "A Series")
+    conn.commit()
+
+    upsert_nu_novel_details(conn, "https://nu/series/a/", make_nu_metadata("https://nu/series/a/"))
+    conn.commit()
+
+    row = get_nu_novel(conn, "https://nu/series/a/")
+    assert row["associated_names"] == "A Series, Alt Name"
+    assert row["genres"] == "Fantasy"
+    assert row["tags"] == "Reincarnation"
+    assert row["author"] == "Some Author"
+    assert row["synopsis"] == "A synopsis."
+    assert row["translation_status"] == "Ongoing"
+    assert row["translation_groups"] == "Group One, Group Two"
+    assert row["release_frequency"] == "1/week"
+    assert row["rating"] == "4.5"
+    assert row["votes"] == "200"
+    assert row["fetched_at"] is not None
+
+
+def test_upsert_nu_novel_details_raises_for_unknown_url(db_path):
+    conn = init_db(db_path)
+    with pytest.raises(ValueError):
+        upsert_nu_novel_details(conn, "https://nu/series/missing/", make_nu_metadata("https://nu/series/missing/"))
+
+
+def test_get_nu_novel_returns_none_when_absent(db_path):
+    conn = init_db(db_path)
+    assert get_nu_novel(conn, "https://nu/series/missing/") is None
+
+
+def test_all_resolved_nu_novels_excludes_listing_only_rows(db_path):
+    conn = init_db(db_path)
+    upsert_nu_novel_listing(conn, "https://nu/series/a/", "A Series")
+    upsert_nu_novel_listing(conn, "https://nu/series/b/", "B Series")
+    conn.commit()
+    upsert_nu_novel_details(conn, "https://nu/series/a/", make_nu_metadata("https://nu/series/a/"))
+    conn.commit()
+
+    resolved = all_resolved_nu_novels(conn)
+
+    assert resolved == [NUCandidate(title="A Series", url="https://nu/series/a/",
+                                     associated_names=["A Series", "Alt Name"])]
+
+
+def test_all_resolved_nu_novels_empty_associated_names_becomes_empty_list(db_path):
+    conn = init_db(db_path)
+    upsert_nu_novel_listing(conn, "https://nu/series/a/", "A Series")
+    conn.commit()
+    upsert_nu_novel_details(conn, "https://nu/series/a/",
+                             make_nu_metadata("https://nu/series/a/", associated_names=[]))
+    conn.commit()
+
+    resolved = all_resolved_nu_novels(conn)
+
+    assert resolved == [NUCandidate(title="A Series", url="https://nu/series/a/",
+                                     associated_names=[])]
+
+
+def test_split_comma_list_roundtrips_with_join_convention():
+    assert split_comma_list(", ".join(["A", "B", "C"]) or None) == ["A", "B", "C"]
+    assert split_comma_list(", ".join([]) or None) == []
+    assert split_comma_list(None) == []
+
+
+def test_stats_includes_nu_novels_progress(db_path):
+    conn = init_db(db_path)
+    upsert_nu_novel_listing(conn, "https://nu/series/a/", "A Series")
+    upsert_nu_novel_listing(conn, "https://nu/series/b/", "B Series")
+    conn.commit()
+    upsert_nu_novel_details(conn, "https://nu/series/a/", make_nu_metadata("https://nu/series/a/"))
+    conn.commit()
+
+    summary = stats(conn, site_key="fanmtl")
+    assert summary["nu_novels_listed"] == 2
+    assert summary["nu_novels_with_details"] == 1
 
 
 # -- chapter sampling -----------------------------------------------------------

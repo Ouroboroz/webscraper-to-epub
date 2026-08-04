@@ -36,28 +36,9 @@ def nu_search_html(hits):
     return f"<ul>{items}</ul>0"
 
 
-def nu_listing_html(entries, has_next=True):
-    """entries: list of (title, url) tuples -> a Novel Updates /novelslisting/
-    browse page, shaped to match novelupdates.list_series()'s selectors --
-    confirmed against a real captured page (2026-08-03): each entry is a
-    div.search_main_box_nu containing div.search_body_nu > div.search_title
-    > a; the pagination widget (div.digg_pagination) carries an
-    a.next_page (rel="next") ONLY when a real next page exists -- past NU's
-    real last page, the listing silently repeats the last page's content
-    but that link disappears, which is the actual (reliable) end signal,
-    not an empty page or a 404."""
-    boxes = "".join(
-        f'<div class="search_main_box_nu"><div class="search_body_nu">'
-        f'<div class="search_title"><a href="{url}">{title}</a></div>'
-        f'</div></div>'
-        for title, url in entries)
-    next_link = '<a class="next_page" href="?pg=2" rel="next"> →</a>' if has_next else ""
-    return f'<html><body><div class="digg_pagination">{next_link}</div>{boxes}</body></html>'
-
-
 def nu_series_html(*, title="Test Series", associated_names=None, genres=None, tags=None,
                     author=None, translation_status=None, translation_groups=None,
-                    release_frequency=None, rating=None, votes=None):
+                    release_frequency=None, rating=None, votes=None, synopsis_paragraphs=None):
     """A Novel Updates series page shaped to match novelupdates.fetch_series()'s
     selectors -- confirmed (2026-08-02) against a real captured page: status
     is div#editstatus (bare text -- "Status in Country of Origin", e.g.
@@ -65,7 +46,10 @@ def nu_series_html(*, title="Test Series", associated_names=None, genres=None, t
     node directly after its <h5> (not wrapped in any tag), and rating/votes
     live together inside the Rating <h5>'s own nested span.uvotes as
     "(rating / 5.0, votes votes)". translation_groups is still unverified
-    (see epub_scraper/novelupdates.py's fetch_series() docstring)."""
+    (see epub_scraper/novelupdates.py's fetch_series() docstring).
+    synopsis_paragraphs: list[str], one per <p> inside div#editdescription --
+    confirmed (2026-08-03) against a real captured page (same shape as
+    FanMTL's own synopsis div, see fanmtl.parse_fanmtl_metadata)."""
     names_html = "<br>".join(associated_names or [])
     genres_html = "".join(f"<a>{g}</a>" for g in (genres or []))
     tags_html = "".join(f"<a>{t}</a>" for t in (tags or []))
@@ -73,6 +57,7 @@ def nu_series_html(*, title="Test Series", associated_names=None, genres=None, t
     groups_html = "".join(
         f'<li><span style="padding-left:20px;">{g}</span></li>' for g in (translation_groups or []))
     status_html = f'<div id="editstatus">{translation_status}</div>' if translation_status else ""
+    synopsis_html = "".join(f"<p>{p}</p>" for p in (synopsis_paragraphs or []))
     sidebar_bits = []
     if release_frequency:
         sidebar_bits.append(f'<h5 class="seriesother">Release Frequency</h5>{release_frequency}')
@@ -90,7 +75,27 @@ def nu_series_html(*, title="Test Series", associated_names=None, genres=None, t
 {status_html}
 <ol class="sp_grouptable">{groups_html}</ol>
 {"".join(sidebar_bits)}
+<div id="editdescription">{synopsis_html}</div>
 </body></html>'''
+
+
+def nu_listing_html(entries, has_next=True):
+    """entries: list of (title, url) tuples -> one page of Novel Updates' own
+    bulk catalog listing (/novelslisting/?st=1&pg=N), shaped to match
+    novelupdates.list_series()'s selectors -- confirmed against a real
+    captured page (2026-08-03): each entry is
+    div.search_main_box_nu > div.search_body_nu > div.search_title > a, and
+    the pagination widget (div.digg_pagination) only carries an
+    `a.next_page` when a genuine next page exists -- that's the real
+    end-of-catalog signal (NOT a 404; a page past the real last page silently
+    clamps/repeats the last page's content instead, confirmed live)."""
+    boxes = "".join(f'''
+<div class="search_main_box_nu"><div class="search_body_nu">
+<div class="search_title"><a href="{url}">{title}</a></div>
+</div></div>''' for title, url in entries)
+    next_link = ('<a class="next_page" href="//www.novelupdates.com/novelslisting/?st=1&pg=2" '
+                 'rel="next">&#8594;</a>') if has_next else ""
+    return f'<html><body>{boxes}<div class="digg_pagination">{next_link}</div></body></html>'
 
 
 def fanmtl_catalog_html(entries):

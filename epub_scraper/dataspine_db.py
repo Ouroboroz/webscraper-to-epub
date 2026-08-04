@@ -1,5 +1,6 @@
 import sqlite3
 
+from . import entity_resolution
 from .util import now_iso
 
 DEFAULT_DB_PATH = "dataspine.db"
@@ -58,6 +59,31 @@ CREATE TABLE IF NOT EXISTS labels (
     drop_chapter INTEGER,
     source TEXT NOT NULL,
     labeled_at TEXT NOT NULL
+);
+
+-- Novel Updates' OWN catalog, independent of the FanMTL `novels` table above
+-- -- `nu-crawl` lists every NU series here (url+title only), `nu-metadata`
+-- then fills in the rest per row. `enrich` matches FanMTL candidates against
+-- this table locally instead of live-searching NU per candidate (see
+-- epub_scraper/novelupdates.py's module docstring for why: NU's whole
+-- catalog is only ~2,475 series, far smaller than the FanMTL pool that used
+-- to be searched against it one at a time).
+CREATE TABLE IF NOT EXISTS nu_novels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    url TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    associated_names TEXT,
+    genres TEXT,
+    tags TEXT,
+    author TEXT,
+    synopsis TEXT,
+    translation_status TEXT,
+    translation_groups TEXT,
+    release_frequency TEXT,
+    rating TEXT,
+    votes TEXT,
+    listed_at TEXT NOT NULL,
+    fetched_at TEXT
 );
 """
 
@@ -366,6 +392,124 @@ def upsert_nu_metadata(conn, site_key, url, resolution, metadata=None):
         )
 
 
+# -- Novel Updates' own catalog (nu_novels) --------------------------------------
+#
+# Independent listing of ALL of Novel Updates' series, crawled once by
+# `nu-crawl`/`nu-metadata` (see dataspine.py) rather than searched per FanMTL
+# candidate. List-valued fields (associated_names/genres/tags/
+# translation_groups) are stored comma-joined TEXT here, matching this file's
+# existing convention for `nu_translation_groups` on the `novels` table above
+# (", ".join(x) or None) -- not JSON, for consistency, even though that's
+# technically lossy for a name containing a literal comma (an accepted
+# tradeoff already made on the `novels` side).
+
+def split_comma_list(text):
+    """Reverse of the ", ".join(x) or None convention this file uses for
+    list-valued TEXT columns -- [] if the column is NULL/empty. Exposed
+    (not just used internally by all_resolved_nu_novels below) since
+    dataspine.py's `enrich` needs the same reverse-split to reconstruct an
+    NUSeriesMetadata from a matched nu_novels row."""
+    return [s.strip() for s in text.split(",")] if text else []
+
+
+def upsert_nu_novel_listing(conn, url, title):
+    """Insert or refresh one entry from Novel Updates' own bulk catalog
+    listing (`nu-crawl`) -- just url+title+listed_at, all the listing page
+    itself exposes. Deliberately never touches fetched_at or any detail
+    column (that's upsert_nu_novel_details' job) -- so re-crawling the
+    listing (e.g. a title changed) can't reset a novel already past its
+    detail fetch back to pending."""
+    conn.execute(
+        """
+        INSERT INTO nu_novels (url, title, listed_at)
+        VALUES (:url, :title, :now)
+        ON CONFLICT(url) DO UPDATE SET title=excluded.title
+        """,
+        {"url": url, "title": title, "now": now_iso()},
+    )
+
+
+def iter_nu_novels_missing_details(conn, limit=None):
+    """nu_novels rows still needing a `nu-metadata` detail fetch (fetched_at
+    IS NULL). Ordered by id, same resumability shape as the
+    iter_candidates_missing_* helpers above."""
+    sql = "SELECT * FROM nu_novels WHERE fetched_at IS NULL ORDER BY id"
+    params = []
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
+def upsert_nu_novel_details(conn, url, metadata):
+    """Fill in one nu_novels row's detail columns from an NUSeriesMetadata
+    (`nu-metadata`'s per-series fetch_series() result) and stamp fetched_at.
+    Raises if the listing crawl hasn't seen this url yet -- same ValueError
+    pattern as upsert_metadata/upsert_nu_metadata. Doesn't touch title --
+    that's owned by the listing crawl (upsert_nu_novel_listing); a series
+    page occasionally lacking a parseable title (see fetch_series()) must
+    not null out a good one already on record."""
+    row = conn.execute("SELECT id FROM nu_novels WHERE url = ?", (url,)).fetchone()
+    if row is None:
+        raise ValueError(f"No nu_novels row for {url} -- run the listing crawl (nu-crawl) first")
+
+    conn.execute(
+        """
+        UPDATE nu_novels SET
+            associated_names=:associated_names, genres=:genres, tags=:tags,
+            author=:author, synopsis=:synopsis,
+            translation_status=:translation_status,
+            translation_groups=:translation_groups,
+            release_frequency=:release_frequency, rating=:rating, votes=:votes,
+            fetched_at=:now
+        WHERE id=:id
+        """,
+        {
+            "associated_names": ", ".join(metadata.associated_names) or None,
+            "genres": ", ".join(metadata.genres) or None,
+            "tags": ", ".join(metadata.tags) or None,
+            "author": metadata.author,
+            "synopsis": metadata.synopsis,
+            "translation_status": metadata.translation_status,
+            "translation_groups": ", ".join(metadata.translation_groups) or None,
+            "release_frequency": metadata.release_frequency,
+            "rating": metadata.rating,
+            "votes": metadata.votes,
+            "now": now_iso(),
+            "id": row["id"],
+        },
+    )
+
+
+def get_nu_novel(conn, url):
+    """Full nu_novels row for `url`, or None. dataspine.py's `enrich` uses
+    this to go from an entity_resolution.NUCandidate's .url (as returned by
+    all_resolved_nu_novels below) back to the full detail row, to reconstruct
+    an NUSeriesMetadata for upsert_nu_metadata -- whose signature/behavior is
+    unchanged, it just expects that duck-typed shape regardless of source."""
+    return conn.execute("SELECT * FROM nu_novels WHERE url = ?", (url,)).fetchone()
+
+
+def all_resolved_nu_novels(conn):
+    """Every nu_novels row with details already fetched (fetched_at IS NOT
+    NULL), as entity_resolution.NUCandidate(title, url, associated_names) --
+    what the local `enrich` scores every FanMTL candidate against. Meant to
+    be loaded ONCE per `enrich` run and reused for every row, not requeried
+    per candidate -- that's the whole point of crawling the catalog locally
+    instead of live-searching it. associated_names is split back out of its
+    comma-joined TEXT storage via split_comma_list(); [] if NULL/empty."""
+    rows = conn.execute(
+        "SELECT url, title, associated_names FROM nu_novels WHERE fetched_at IS NOT NULL"
+    ).fetchall()
+    return [
+        entity_resolution.NUCandidate(
+            title=row["title"], url=row["url"],
+            associated_names=split_comma_list(row["associated_names"]),
+        )
+        for row in rows
+    ]
+
+
 def iter_candidates_missing_chapters(conn, site_key, limit=None):
     """Candidates that still need a chapter-sample attempt -- no attempt
     recorded yet, successful or not. Ordered by id, same resumability shape
@@ -553,6 +697,10 @@ def stats(conn, site_key=None):
         "candidate = 1 AND nu_resolution IS NOT NULL GROUP BY nu_resolution",
         params,
     ).fetchall())
+    nu_novels_listed = conn.execute("SELECT COUNT(*) FROM nu_novels").fetchone()[0]
+    nu_novels_with_details = conn.execute(
+        "SELECT COUNT(*) FROM nu_novels WHERE fetched_at IS NOT NULL"
+    ).fetchone()[0]
 
     return {
         "total": total,
@@ -562,4 +710,6 @@ def stats(conn, site_key=None):
         "candidates_with_embedding": with_embedding,
         "candidates_by_status": by_status,
         "candidates_by_nu_resolution": by_nu_resolution,
+        "nu_novels_listed": nu_novels_listed,
+        "nu_novels_with_details": nu_novels_with_details,
     }
