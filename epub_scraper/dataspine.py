@@ -9,8 +9,11 @@ Usage:
                                           [--pacing-file FILE] [--refresh] [--db FILE]
   python -m epub_scraper.dataspine metadata [--limit N] [--delay SECS]
                                              [--pacing-file FILE] [--db FILE]
-  python -m epub_scraper.dataspine enrich [--limit N] [--search-candidates N]
-                                           [--delay SECS] [--pacing-file FILE] [--db FILE]
+  python -m epub_scraper.dataspine nu-crawl [--start-page N] [--pages N] [--delay SECS]
+                                             [--pacing-file FILE] [--db FILE]
+  python -m epub_scraper.dataspine nu-metadata [--limit N] [--delay SECS]
+                                                [--pacing-file FILE] [--db FILE]
+  python -m epub_scraper.dataspine enrich [--limit N] [--db FILE]
   python -m epub_scraper.dataspine chapters [--count N] [--limit N] [--delay SECS]
                                              [--pacing-file FILE] [--db FILE]
   python -m epub_scraper.dataspine embed [--limit N] [--model NAME] [--db FILE]
@@ -26,34 +29,61 @@ persisted in the DB itself (crawl_state table) after every page, so a killed
 or interrupted run picks back up on its own -- pass --start-page explicitly
 only to override that. `metadata` then fetches the full index page for each
 candidate still missing a synopsis (i.e. not yet processed), so it's safe to
-re-run repeatedly as the candidate set grows. `enrich` resolves candidates
-against Novel Updates (requires requirements-novelupdates.txt -- see that
-file and epub_scraper/novelupdates.py's docstring). `chapters` samples the
-first --count chapters (default 5 -- most novels can be judged on their
-opening) of each candidate's actual prose, for signal synopsis/tags/metadata
-alone can't capture (pacing, prose quality, whether the hook lands) --
-reuses epub_scraper.scrape.scrape_chapters() (the same engine the interactive
-EPUB-download pipeline uses, including its on-disk .cache/, so a chapter
-sampled here is already warm if the novel later gets a full download)
-instead of a second chapter fetcher. `embed`/`cluster`/`tag-communities` are
-Stage 1 (corpus structure) -- pure local computation, no network at all, see
-epub_scraper/corpus_structure.py's docstring. They only need `synopsis` +
-tags (already available once `metadata`/`enrich` have run on a candidate),
-not `chapters` or a fully-finished `enrich`. Unlike the other subcommands,
-`cluster`/`tag-communities` are full recomputes over the whole corpus each
-time, not incremental -- a cluster boundary can shift for every novel as the
-corpus grows.
+re-run repeatedly as the candidate set grows.
 
-All three long-running commands share the same Pacer (epub_scraper.pacing --
+`nu-crawl`/`nu-metadata`/`enrich` resolve candidates against Novel Updates
+(requires requirements-novelupdates.txt -- see that file and
+epub_scraper/novelupdates.py's docstring), but NOT by live-searching NU per
+FanMTL candidate the way `enrich` originally did. **2026-08-03 finding**:
+NU's entire catalog is only ~2,475 series total -- tiny next to the FanMTL
+candidate pool (up to 105,049), so a live search per candidate was
+guaranteed to whiff on the vast majority of them (>95%), against a site 40x
+smaller than what was being searched. Fixed by crawling NU's own catalog
+locally first: `nu-crawl` paginates NU's bulk `/novelslisting/` listing (same
+resumable crawl_state-checkpoint shape as `crawl`, site_key="novelupdates";
+short, ~100 pages) into the `nu_novels` table (url+title only), then
+`nu-metadata` fetches each of those series pages in full (synopsis/genres/
+tags/author/status/...) the same way `metadata` does for FanMTL, filling in
+the rest of `nu_novels`. Only once both have run does `enrich` do anything
+useful: it's now a **pure local computation, no network calls at all** --
+loads every resolved `nu_novels` row once, then RapidFuzz-scores every
+pending FanMTL candidate against that fixed local set
+(epub_scraper.entity_resolution.resolve()). NU's synopsis/tags aren't copied
+onto the FanMTL `novels` row through this path -- Stage 8 will read
+`nu_novels.synopsis`/`.tags` directly when it needs them, no duplication.
+
+`chapters` samples the first --count chapters (default 5 -- most novels can
+be judged on their opening) of each candidate's actual prose, for signal
+synopsis/tags/metadata alone can't capture (pacing, prose quality, whether
+the hook lands) -- reuses epub_scraper.scrape.scrape_chapters() (the same
+engine the interactive EPUB-download pipeline uses, including its on-disk
+.cache/, so a chapter sampled here is already warm if the novel later gets a
+full download) instead of a second chapter fetcher. `embed`/`cluster`/
+`tag-communities` are Stage 1 (corpus structure) -- pure local computation,
+no network at all, see epub_scraper/corpus_structure.py's docstring. They
+only need `synopsis` + tags (already available once `metadata`/`enrich` have
+run on a candidate), not `chapters` or a fully-finished `enrich`. Unlike the
+other subcommands, `cluster`/`tag-communities` are full recomputes over the
+whole corpus each time, not incremental -- a cluster boundary can shift for
+every novel as the corpus grows.
+
+The network-bound commands share the same Pacer (epub_scraper.pacing --
 originally built for the chapter scraper) via --pacing-file: a persisted,
 jittered per-site interval that widens on a 429 or a detected challenge page
 and never resets on its own. `crawl`/`metadata` route fetch failures through
-fetcher.note_throttle(); `enrich`'s Novel Updates calls go through curl_cffi,
-not requests, so they use a separate duck-typed _note_nu_throttle() for the
-same 429-widening behavior (curl_cffi's HTTPError isn't a requests.HTTPError
-subclass, confirmed live -- note_throttle() would silently never match it)
-and keep their own existing ChallengeExpired re-solve logic on top -- one
-persisted pacing.json across the whole pipeline either way.
+fetcher.note_throttle(); `nu-crawl`/`nu-metadata`'s Novel Updates calls go
+through curl_cffi, not requests, so they use a separate duck-typed
+_note_nu_throttle() for the same 429-widening behavior (curl_cffi's
+HTTPError isn't a requests.HTTPError subclass, confirmed live --
+note_throttle() would silently never match it) and keep their own
+ChallengeExpired re-solve logic on top -- one persisted pacing.json across
+the whole pipeline either way. `nu-metadata` additionally escalates to a
+forced session re-solve after MAX_CONSECUTIVE_429S back-to-back 429s (a
+sustained run of them likely means the session itself is now suspect, not
+just that the gap needs to widen further) -- `nu-crawl` is short enough
+(~100 pages) that basic re-solve-on-ChallengeExpired is enough on its own.
+Both stay sequential-only (no --workers) -- Cloudflare-protected, same prior
+sustained-429 evidence, no reason to hit it with concurrency.
 """
 
 import argparse
@@ -63,11 +93,13 @@ import requests
 from bs4 import BeautifulSoup
 
 from . import corpus_structure, entity_resolution, novelupdates
-from .dataspine_db import (DEFAULT_DB_PATH, get_next_page, get_novel, init_db,
-                            iter_candidates_missing_chapters, iter_candidates_missing_metadata,
-                            iter_candidates_missing_nu_resolution, recompute_candidates,
-                            set_next_page, stats, upsert_catalog_entry, upsert_chapters,
-                            upsert_metadata, upsert_nu_metadata)
+from .dataspine_db import (DEFAULT_DB_PATH, all_resolved_nu_novels, get_next_page, get_novel,
+                            get_nu_novel, init_db, iter_candidates_missing_chapters,
+                            iter_candidates_missing_metadata, iter_candidates_missing_nu_resolution,
+                            iter_nu_novels_missing_details, recompute_candidates, set_next_page,
+                            split_comma_list, stats, upsert_catalog_entry, upsert_chapters,
+                            upsert_metadata, upsert_nu_metadata, upsert_nu_novel_details,
+                            upsert_nu_novel_listing)
 from .fetcher import HEADERS, fetch, note_throttle
 from .pacing import DEFAULT_PACING_PATH, Pacer
 from .scrape import scrape_chapters
@@ -77,13 +109,21 @@ from .sites.fanmtl import CATALOG_URL_TEMPLATE, PROFILE, parse_fanmtl_catalog_pa
 SITE_KEY = "fanmtl"
 NU_SITE_KEY = "novelupdates"
 DEFAULT_CHAPTER_SAMPLE_SIZE = 5
-# Bounded re-solves per `enrich` run if the Cloudflare session expires
-# mid-run -- protects against looping forever if solving itself is broken.
+# Bounded re-solves per `nu-crawl`/`nu-metadata` run if the Cloudflare session
+# expires mid-run -- protects against looping forever if solving itself is
+# broken.
 MAX_CHALLENGE_RESOLVES = 2
 # Bounded retries per catalog page in `crawl` before giving up the whole run --
 # a transient error/429/challenge shouldn't kill a multi-hour unattended crawl,
 # but a truly dead site/URL shouldn't retry forever either.
 MAX_PAGE_RETRIES = 5
+# `nu-metadata` only: MAX_CONSECUTIVE_429S back-to-back 429s force a fresh
+# challenge solve rather than just relying on the pacer's widening gap --
+# sustained 429s likely mean this session itself is now suspect/rate-limited,
+# not just that the interval needs to widen further. Not applied to
+# `nu-crawl`, a short ~100-page run where this escalation isn't worth the
+# complexity (see module docstring).
+MAX_CONSECUTIVE_429S = 3
 
 
 def _session():
@@ -238,45 +278,47 @@ def cmd_metadata(args):
             time.sleep(pacer.gap(SITE_KEY))
 
 
-def _resolve_one(session, row, search_candidates):
-    """search() + fetch_series() + entity_resolution.resolve() for one
-    candidate. Returns (resolution, matched_metadata_or_None)."""
-    metadatas = novelupdates.find_nu_candidates(session, row["title"], limit=search_candidates)
-    nu_candidates = [entity_resolution.NUCandidate(m.title, m.url, m.associated_names)
-                      for m in metadatas]
-    resolution = entity_resolution.resolve(row["title"], row["alt_title"], nu_candidates)
-
-    matched = None
-    if resolution.decision == "auto":
-        matched = next(m for m in metadatas if m.url == resolution.best.url)
-    return resolution, matched
-
-
-def cmd_enrich(args):
-    conn = init_db(args.db)
-    pacer = Pacer.load(args.pacing_file, default_interval=args.delay)
-    rows = iter_candidates_missing_nu_resolution(conn, SITE_KEY, limit=args.limit)
-    if not rows:
-        print("No candidates pending Novel Updates enrichment.")
-        return
-
+def _start_nu_session():
+    """solve_challenge_session(), with the same ImportError/ChallengeExpired
+    -> print-and-bail handling `nu-crawl`/`nu-metadata` both need at startup.
+    Returns the session, or None if the caller should just return."""
     try:
-        session = novelupdates.solve_challenge_session()
+        return novelupdates.solve_challenge_session()
     except ImportError as e:
         print(f"Could not start a Novel Updates session: {e}")
         print("Install requirements-novelupdates.txt (needs a real Chrome + Xvfb on Linux) "
               "and try `python -m epub_scraper.novelupdates check` first.")
-        return
+        return None
     except novelupdates.ChallengeExpired as e:
         print(f"Could not solve the Novel Updates challenge: {e}")
         print("Try `python -m epub_scraper.novelupdates check` on its own to debug.")
+        return None
+
+
+def cmd_nu_crawl(args):
+    conn = init_db(args.db)
+    pacer = Pacer.load(args.pacing_file, default_interval=args.delay)
+
+    session = _start_nu_session()
+    if session is None:
         return
 
+    page = args.start_page
+    if page is None:
+        page = get_next_page(conn, NU_SITE_KEY)
+        if page == 0:
+            # get_next_page()'s "never crawled" sentinel is 0, but NU's own
+            # pagination starts at 1 -- pg=0 isn't a real page.
+            page = 1
+
     resolves_left = MAX_CHALLENGE_RESOLVES
+    pages_fetched = 0
+    total_hits = 0
     started_at = time.monotonic()
-    for i, row in enumerate(rows):
+
+    while args.pages is None or pages_fetched < args.pages:
         try:
-            resolution, matched = _resolve_one(session, row, args.search_candidates)
+            hits, has_next = novelupdates.list_series(session, page)
         except novelupdates.ChallengeExpired:
             if resolves_left <= 0:
                 print("Challenge re-solve budget exhausted -- stopping this run.")
@@ -285,26 +327,140 @@ def cmd_enrich(args):
             session = novelupdates.solve_challenge_session()
             resolves_left -= 1
             try:
-                resolution, matched = _resolve_one(session, row, args.search_candidates)
+                hits, has_next = novelupdates.list_series(session, page)
+            except novelupdates.ChallengeExpired:
+                print(f"Still blocked after re-solve on page {page} -- stopping this run.")
+                break
+        except Exception as e:
+            _note_nu_throttle(pacer, e)
+            print(f"Error fetching page {page}: {e} -- stopping this run.")
+            break
+
+        for hit in hits:
+            upsert_nu_novel_listing(conn, hit.url, hit.title)
+        total_hits += len(hits)
+        conn.commit()
+
+        pages_fetched += 1
+        page += 1
+        set_next_page(conn, NU_SITE_KEY, page)
+        conn.commit()
+
+        elapsed = time.monotonic() - started_at
+        print(f"[page {page - 1}] {len(hits)} novels  "
+              f"({total_hits} total this run, {elapsed / 60:.1f}m elapsed)")
+
+        if not has_next:
+            print("Reached the last page of Novel Updates' catalog listing.")
+            break
+
+        if args.pages is None or pages_fetched < args.pages:
+            time.sleep(pacer.gap(NU_SITE_KEY))
+
+    print("-" * 56)
+    print(f"Next run will resume at page {page} automatically (or pass --start-page to override)")
+
+
+def cmd_nu_metadata(args):
+    conn = init_db(args.db)
+    pacer = Pacer.load(args.pacing_file, default_interval=args.delay)
+
+    rows = iter_nu_novels_missing_details(conn, limit=args.limit)
+    if not rows:
+        print("No Novel Updates novels pending a detail fetch.")
+        return
+
+    session = _start_nu_session()
+    if session is None:
+        return
+
+    resolves_left = MAX_CHALLENGE_RESOLVES
+    consecutive_429s = 0
+    started_at = time.monotonic()
+    for i, row in enumerate(rows):
+        try:
+            metadata = novelupdates.fetch_series(session, row["url"])
+        except novelupdates.ChallengeExpired:
+            if resolves_left <= 0:
+                print("Challenge re-solve budget exhausted -- stopping this run.")
+                break
+            print("  session expired -- re-solving the challenge...")
+            session = novelupdates.solve_challenge_session()
+            resolves_left -= 1
+            consecutive_429s = 0
+            try:
+                metadata = novelupdates.fetch_series(session, row["url"])
             except novelupdates.ChallengeExpired:
                 print(f"[{i + 1}/{len(rows)}] still blocked after re-solve on "
                       f"{row['title']!r}, skipping for this run")
                 continue
         except Exception as e:
-            _note_nu_throttle(pacer, e)
-            print(f"[{i + 1}/{len(rows)}] error resolving {row['title']!r}: {e}")
+            was_429 = _note_nu_throttle(pacer, e)
+            print(f"[{i + 1}/{len(rows)}] error fetching {row['title']!r}: {e}")
+            consecutive_429s = consecutive_429s + 1 if was_429 else 0
+            if was_429 and consecutive_429s >= MAX_CONSECUTIVE_429S:
+                if resolves_left <= 0:
+                    print("Challenge re-solve budget exhausted -- stopping this run.")
+                    break
+                print(f"  {consecutive_429s} sustained 429s -- re-solving the challenge for "
+                      f"a fresh session...")
+                session = novelupdates.solve_challenge_session()
+                resolves_left -= 1
+                consecutive_429s = 0
             continue
+        else:
+            consecutive_429s = 0
 
-        upsert_nu_metadata(conn, SITE_KEY, row["url"], resolution.decision, matched)
+        upsert_nu_novel_details(conn, row["url"], metadata)
         conn.commit()
-
-        detail = f" -- {matched.title!r}" if matched is not None else ""
         elapsed = time.monotonic() - started_at
-        print(f"[{i + 1}/{len(rows)}] {row['title']!r} -> {resolution.decision}{detail}  "
-              f"({elapsed / 60:.1f}m elapsed)")
+        synopsis_status = "ok" if metadata.synopsis else "MISSING"
+        print(f"[{i + 1}/{len(rows)}] {row['title']!r}  "
+              f"({len(metadata.genres)} genres, synopsis {synopsis_status}, "
+              f"{elapsed / 60:.1f}m elapsed)")
 
         if i < len(rows) - 1:
             time.sleep(pacer.gap(NU_SITE_KEY))
+
+
+def _nu_metadata_from_row(row):
+    """Reconstruct an NUSeriesMetadata from a nu_novels row (as returned by
+    dataspine_db.get_nu_novel) for upsert_nu_metadata -- which expects that
+    duck-typed shape regardless of whether it came from a live fetch_series()
+    call (the old `enrich`) or, as here, a row `nu-metadata` already fetched
+    into the local catalog. List-valued fields are split back out of their
+    comma-joined TEXT storage via dataspine_db.split_comma_list()."""
+    return novelupdates.NUSeriesMetadata(
+        url=row["url"], title=row["title"],
+        associated_names=split_comma_list(row["associated_names"]),
+        genres=split_comma_list(row["genres"]), tags=split_comma_list(row["tags"]),
+        author=row["author"], translation_status=row["translation_status"],
+        translation_groups=split_comma_list(row["translation_groups"]),
+        release_frequency=row["release_frequency"], rating=row["rating"], votes=row["votes"],
+        synopsis=row["synopsis"],
+    )
+
+
+def cmd_enrich(args):
+    conn = init_db(args.db)
+    nu_candidates = all_resolved_nu_novels(conn)  # loaded once, reused for every row below
+    rows = iter_candidates_missing_nu_resolution(conn, SITE_KEY, limit=args.limit)
+    if not rows:
+        print("No candidates pending Novel Updates enrichment.")
+        return
+    if not nu_candidates:
+        print("No resolved Novel Updates novels yet -- run `nu-crawl` then `nu-metadata` first.")
+        return
+
+    for i, row in enumerate(rows, start=1):
+        resolution = entity_resolution.resolve(row["title"], row["alt_title"], nu_candidates)
+        matched = None
+        if resolution.decision == "auto":
+            matched = _nu_metadata_from_row(get_nu_novel(conn, resolution.best.url))
+        upsert_nu_metadata(conn, SITE_KEY, row["url"], resolution.decision, matched)
+        conn.commit()
+        detail = f" -- {matched.title!r}" if matched is not None else ""
+        print(f"[{i}/{len(rows)}] {row['title']!r} -> {resolution.decision}{detail}")
 
 
 def _plain_text_from_chapter_body(body_html):
@@ -409,6 +565,8 @@ def cmd_stats(args):
     for resolution, count in sorted(summary["candidates_by_nu_resolution"].items(),
                                      key=lambda kv: -kv[1]):
         print(f"    {resolution}: {count}")
+    print(f"Novel Updates catalog (nu_novels): {summary['nu_novels_listed']} listed, "
+          f"{summary['nu_novels_with_details']} with details")
 
 
 def build_parser():
@@ -441,12 +599,34 @@ def build_parser():
     p_metadata.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
     p_metadata.set_defaults(func=cmd_metadata)
 
-    p_enrich = sub.add_parser("enrich", help="Resolve candidates against Novel Updates")
-    p_enrich.add_argument("--limit", type=int, default=20, metavar="N")
-    p_enrich.add_argument("--search-candidates", type=int, default=5, metavar="N",
-                           help="Max Novel Updates search results to fetch per novel (default: 5)")
-    p_enrich.add_argument("--delay", type=float, default=2.5, metavar="SECS")
-    p_enrich.add_argument("--pacing-file", default=DEFAULT_PACING_PATH, metavar="FILE")
+    p_nu_crawl = sub.add_parser(
+        "nu-crawl", help="Crawl Novel Updates' own bulk catalog listing into nu_novels")
+    p_nu_crawl.add_argument("--start-page", type=int, default=None, metavar="N",
+                             help="Page to start from (default: resume automatically from "
+                                  "wherever the last run left off; NU's pg= starts at 1, not 0)")
+    p_nu_crawl.add_argument("--pages", type=int, default=None, metavar="N",
+                             help="Pages to fetch this run (default: no limit -- NU's whole "
+                                  "catalog is only ~100 pages, so a full run is reasonable)")
+    p_nu_crawl.add_argument("--delay", type=float, default=2.5, metavar="SECS")
+    p_nu_crawl.add_argument("--pacing-file", default=DEFAULT_PACING_PATH, metavar="FILE")
+    p_nu_crawl.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
+    p_nu_crawl.set_defaults(func=cmd_nu_crawl)
+
+    p_nu_metadata = sub.add_parser(
+        "nu-metadata", help="Fetch full detail (synopsis/tags/...) for nu_novels missing it")
+    p_nu_metadata.add_argument("--limit", type=int, default=50, metavar="N")
+    p_nu_metadata.add_argument("--delay", type=float, default=2.5, metavar="SECS")
+    p_nu_metadata.add_argument("--pacing-file", default=DEFAULT_PACING_PATH, metavar="FILE")
+    p_nu_metadata.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
+    p_nu_metadata.set_defaults(func=cmd_nu_metadata)
+
+    p_enrich = sub.add_parser(
+        "enrich", help="Resolve candidates against the locally-crawled Novel Updates catalog "
+                       "(run nu-crawl + nu-metadata first)")
+    p_enrich.add_argument("--limit", type=int, default=100000, metavar="N",
+                           help="Max candidates to process this run (default: 100000 -- this "
+                                "is pure local computation now, no need for a small "
+                                "network-era default)")
     p_enrich.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
     p_enrich.set_defaults(func=cmd_enrich)
 

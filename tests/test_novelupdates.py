@@ -1,12 +1,13 @@
 import pytest
 
 from epub_scraper.novelupdates import (ChallengeExpired, NUSearchHit, fetch_series,
-                                        looks_like_challenge_page, search)
+                                        list_series, looks_like_challenge_page, search)
 from conftest import load_fixture
 from fakes import FakeResponse, FakeSession
-from html_builders import nu_search_html, nu_series_html
+from html_builders import nu_listing_html, nu_search_html, nu_series_html
 
 BASE_URL = "https://www.novelupdates.com"
+LISTING_URL = f"{BASE_URL}/novelslisting/"
 
 
 def test_looks_like_challenge_page_real_fixture():
@@ -184,3 +185,79 @@ def test_fetch_series_raises_challenge_expired_when_blocked():
     session = FakeSession({url: FakeResponse(html, 200, url)})
     with pytest.raises(ChallengeExpired):
         fetch_series(session, url)
+
+
+def test_fetch_series_parses_synopsis_from_multiple_paragraphs():
+    url = "https://www.novelupdates.com/series/x/"
+    html = nu_series_html(title="X", synopsis_paragraphs=["First paragraph.", "Second paragraph."])
+    session = FakeSession({url: FakeResponse(html, 200, url)})
+
+    result = fetch_series(session, url)
+
+    assert result.synopsis == "First paragraph.\n\nSecond paragraph."
+
+
+def test_fetch_series_synopsis_is_none_when_absent():
+    url = "https://www.novelupdates.com/series/x/"
+    html = nu_series_html(title="X")
+    session = FakeSession({url: FakeResponse(html, 200, url)})
+
+    result = fetch_series(session, url)
+
+    assert result.synopsis is None
+
+
+def test_fetch_series_real_fixture_reverend_insanity_synopsis():
+    # Same real captured fixture the other real_fixture test above uses --
+    # confirms the synopsis extraction against real markup, not just the
+    # synthetic builder.
+    url = "https://www.novelupdates.com/series/reverend-insanity/"
+    html = load_fixture("novelupdates_series_reverend_insanity.html")
+    session = FakeSession({url: FakeResponse(html, 200, url)})
+
+    result = fetch_series(session, url)
+
+    assert result.synopsis is not None
+    assert "Fang Yuan" in result.synopsis or "Gu" in result.synopsis
+
+
+# -- list_series (Novel Updates' own bulk catalog listing) ------------------------
+
+def test_list_series_parses_hits_and_has_next_true():
+    html = nu_listing_html([
+        ("Novel A", "https://www.novelupdates.com/series/a/"),
+        ("Novel B", "https://www.novelupdates.com/series/b/"),
+    ], has_next=True)
+    session = FakeSession({LISTING_URL: FakeResponse(html, 200, LISTING_URL)})
+
+    hits, has_next = list_series(session, page=1)
+
+    assert hits == [
+        NUSearchHit("Novel A", "https://www.novelupdates.com/series/a/"),
+        NUSearchHit("Novel B", "https://www.novelupdates.com/series/b/"),
+    ]
+    assert has_next is True
+    method, url, kwargs = session.calls[0]
+    assert method == "GET"
+    assert kwargs["params"] == {"st": 1, "pg": 1}
+
+
+def test_list_series_has_next_false_on_last_page():
+    # Confirmed live (2026-08-03): the real last page's pagination widget has
+    # no a.next_page link -- NOT a 404 or an empty page (a page past the real
+    # boundary silently clamps/repeats the last page's own content instead).
+    html = nu_listing_html([("Novel A", "https://www.novelupdates.com/series/a/")],
+                            has_next=False)
+    session = FakeSession({LISTING_URL: FakeResponse(html, 200, LISTING_URL)})
+
+    hits, has_next = list_series(session, page=99)
+
+    assert len(hits) == 1
+    assert has_next is False
+
+
+def test_list_series_raises_challenge_expired_when_blocked():
+    html = load_fixture("novelupdates_cloudflare_challenge.html")
+    session = FakeSession({LISTING_URL: FakeResponse(html, 200, LISTING_URL)})
+    with pytest.raises(ChallengeExpired):
+        list_series(session, page=1)

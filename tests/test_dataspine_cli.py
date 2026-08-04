@@ -1,12 +1,17 @@
 from epub_scraper import dataspine
 from epub_scraper.dataspine_db import (get_next_page, get_novel, init_db,
-                                        iter_candidates_missing_chapters)
+                                        iter_candidates_missing_chapters,
+                                        iter_nu_novels_missing_details, upsert_nu_novel_details,
+                                        upsert_nu_novel_listing)
+from epub_scraper.novelupdates import NUSeriesMetadata
 from fakes import FakeResponse, FakeSession
 from conftest import load_fixture
-from html_builders import fanmtl_catalog_html, fanmtl_chapter_html, nu_search_html, nu_series_html
+from html_builders import (fanmtl_catalog_html, fanmtl_chapter_html, nu_listing_html,
+                            nu_search_html, nu_series_html)
 
 NU_BASE_URL = "https://www.novelupdates.com"
 NU_AJAX_URL = f"{NU_BASE_URL}/wp-admin/admin-ajax.php"
+NU_LISTING_URL = f"{NU_BASE_URL}/novelslisting/"
 
 BASE_URL = "https://www.fanmtl.com"
 
@@ -172,64 +177,81 @@ def _crawl_one(monkeypatch, db_path, chapter_id, title="A Novel"):
     run_cli(monkeypatch, ["crawl", "--db", db_path], session)
 
 
-def test_cmd_enrich_resolves_auto_match(monkeypatch, db_path):
-    _crawl_one(monkeypatch, db_path, "ri1", title="Reverend Insanity")
+# -- nu-crawl (Novel Updates' own bulk catalog listing) -------------------------
 
-    series_url = f"{NU_BASE_URL}/series/reverend-insanity/"
-    search_html = nu_search_html([("Reverend Insanity", series_url)])
-    series_html = nu_series_html(title="Reverend Insanity", associated_names=["Reverend Insanity"],
-                                  genres=["Action"], tags=["Cultivation"])
-    nu_session = FakeSession({
-        NU_AJAX_URL: FakeResponse(search_html, 200, NU_AJAX_URL),
-        series_url: FakeResponse(series_html, 200, series_url),
-    })
+def test_cmd_nu_crawl_paginates_until_has_next_false_and_stores_listings(monkeypatch, db_path):
+    # FakeSession keys by URL only (query params aren't part of the dict key
+    # -- list_series() passes page via `params=`, not baked into the URL), so
+    # successive pages are simulated with a call-counting callable, same
+    # pattern the crawl-retry tests above use.
+    page1 = nu_listing_html([("Novel A", f"{NU_BASE_URL}/series/a/")], has_next=True)
+    page2 = nu_listing_html([("Novel B", f"{NU_BASE_URL}/series/b/")], has_next=False)
+    calls = {"n": 0}
+
+    def listing_response():
+        calls["n"] += 1
+        return FakeResponse(page1 if calls["n"] == 1 else page2, 200, NU_LISTING_URL)
+
+    nu_session = FakeSession({NU_LISTING_URL: listing_response})
     monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", lambda *a, **kw: nu_session)
 
-    run_cli(monkeypatch, ["enrich", "--db", db_path], FakeSession({}))
+    run_cli(monkeypatch, ["nu-crawl", "--db", db_path], FakeSession({}))
 
+    assert calls["n"] == 2  # stopped once has_next was False, not a fixed page count
     conn = init_db(db_path)
-    novel = get_novel(conn, "fanmtl", f"{BASE_URL}/novel/ri1.html")
-    assert novel["nu_resolution"] == "auto"
-    assert novel["nu_url"] == series_url
-    assert novel["nu_title"] == "Reverend Insanity"
+    rows = conn.execute("SELECT url, title FROM nu_novels ORDER BY id").fetchall()
+    assert [(r["url"], r["title"]) for r in rows] == [
+        (f"{NU_BASE_URL}/series/a/", "Novel A"), (f"{NU_BASE_URL}/series/b/", "Novel B")]
 
 
-def test_cmd_enrich_no_search_results_records_no_candidates(monkeypatch, db_path):
-    _crawl_one(monkeypatch, db_path, "obs1", title="Obscure Novel")
+def test_cmd_nu_crawl_resumes_automatically_without_start_page(monkeypatch, db_path, tmp_path):
+    page1 = nu_listing_html([("Novel A", f"{NU_BASE_URL}/series/a/")], has_next=True)
+    session0 = FakeSession({NU_LISTING_URL: FakeResponse(page1, 200, NU_LISTING_URL)})
+    monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", lambda *a, **kw: session0)
+    run_cli(monkeypatch, ["nu-crawl", "--pages", "1", "--pacing-file",
+                          str(tmp_path / "pacing.json"), "--db", db_path], FakeSession({}))
 
-    nu_session = FakeSession({
-        NU_AJAX_URL: FakeResponse(nu_search_html([]), 200, NU_AJAX_URL),
-    })
+    # Second run only stubs one response -- if it restarted at page 1 instead
+    # of resuming at page 2, it'd still "work" against this stub (same URL
+    # key), so the real proof is the recorded call's params below.
+    page2 = nu_listing_html([("Novel B", f"{NU_BASE_URL}/series/b/")], has_next=False)
+    session1 = FakeSession({NU_LISTING_URL: FakeResponse(page2, 200, NU_LISTING_URL)})
+    monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", lambda *a, **kw: session1)
+    run_cli(monkeypatch, ["nu-crawl", "--pages", "1", "--pacing-file",
+                          str(tmp_path / "pacing.json"), "--db", db_path], FakeSession({}))
+
+    assert session1.calls[0][2]["params"] == {"st": 1, "pg": 2}
+    conn = init_db(db_path)
+    urls = {r["url"] for r in conn.execute("SELECT url FROM nu_novels")}
+    assert urls == {f"{NU_BASE_URL}/series/a/", f"{NU_BASE_URL}/series/b/"}
+    assert get_next_page(conn, "novelupdates") == 3
+
+
+def test_cmd_nu_crawl_first_run_starts_at_page_1_not_0(monkeypatch, db_path):
+    # get_next_page()'s generic "never crawled" sentinel is 0, but NU's own
+    # pagination starts at 1 -- confirmed live (2026-08-03).
+    page1 = nu_listing_html([("Novel A", f"{NU_BASE_URL}/series/a/")], has_next=False)
+    nu_session = FakeSession({NU_LISTING_URL: FakeResponse(page1, 200, NU_LISTING_URL)})
     monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", lambda *a, **kw: nu_session)
 
-    run_cli(monkeypatch, ["enrich", "--db", db_path], FakeSession({}))
+    run_cli(monkeypatch, ["nu-crawl", "--db", db_path], FakeSession({}))
 
-    conn = init_db(db_path)
-    novel = get_novel(conn, "fanmtl", f"{BASE_URL}/novel/obs1.html")
-    assert novel["nu_resolution"] == "no_candidates"
-    assert novel["nu_url"] is None
+    assert nu_session.calls[0][2]["params"] == {"st": 1, "pg": 1}
 
 
-def test_cmd_enrich_resolves_session_expiry_mid_run(monkeypatch, db_path):
-    _crawl_one(monkeypatch, db_path, "ri1", title="Reverend Insanity")
-
-    series_url = f"{NU_BASE_URL}/series/reverend-insanity/"
+def test_cmd_nu_crawl_resolves_session_expiry_mid_run(monkeypatch, db_path):
     challenge_html = load_fixture("novelupdates_cloudflare_challenge.html")
-    search_html = nu_search_html([("Reverend Insanity", series_url)])
-    series_html = nu_series_html(title="Reverend Insanity", associated_names=["Reverend Insanity"])
+    listing_html = nu_listing_html([("Novel A", f"{NU_BASE_URL}/series/a/")], has_next=False)
 
     call_count = {"n": 0}
 
-    def search_response():
+    def listing_response():
         call_count["n"] += 1
         if call_count["n"] == 1:
-            return FakeResponse(challenge_html, 200, NU_AJAX_URL)
-        return FakeResponse(search_html, 200, NU_AJAX_URL)
+            return FakeResponse(challenge_html, 200, NU_LISTING_URL)
+        return FakeResponse(listing_html, 200, NU_LISTING_URL)
 
-    nu_session = FakeSession({
-        NU_AJAX_URL: search_response,
-        series_url: FakeResponse(series_html, 200, series_url),
-    })
+    nu_session = FakeSession({NU_LISTING_URL: listing_response})
 
     solve_calls = {"n": 0}
 
@@ -239,36 +261,195 @@ def test_cmd_enrich_resolves_session_expiry_mid_run(monkeypatch, db_path):
 
     monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", fake_solve)
 
-    run_cli(monkeypatch, ["enrich", "--db", db_path], FakeSession({}))
+    run_cli(monkeypatch, ["nu-crawl", "--db", db_path], FakeSession({}))
 
     assert solve_calls["n"] == 2  # initial solve + one re-solve after the challenge came back
     conn = init_db(db_path)
-    novel = get_novel(conn, "fanmtl", f"{BASE_URL}/novel/ri1.html")
-    assert novel["nu_resolution"] == "auto"
+    assert conn.execute("SELECT COUNT(*) FROM nu_novels").fetchone()[0] == 1
 
 
-def test_cmd_enrich_widens_pacer_on_429(monkeypatch, db_path, tmp_path):
-    # Confirmed live (2026-08-03): a real enrich run hit sustained 429s and
-    # the pacer never widened, because curl_cffi's HTTPError isn't a
+# -- nu-metadata (per-series Novel Updates detail fetch) -------------------------
+
+def _seed_nu_listing(db_path, url, title):
+    conn = init_db(db_path)
+    upsert_nu_novel_listing(conn, url, title)
+    conn.commit()
+
+
+def test_cmd_nu_metadata_fills_in_details_for_pending_novel(monkeypatch, db_path):
+    nu_url = f"{NU_BASE_URL}/series/reverend-insanity/"
+    _seed_nu_listing(db_path, nu_url, "Reverend Insanity")
+
+    series_html = nu_series_html(title="Reverend Insanity", associated_names=["Reverend Insanity"],
+                                  genres=["Action"], tags=["Cultivation"],
+                                  synopsis_paragraphs=["A great story."])
+    nu_session = FakeSession({nu_url: FakeResponse(series_html, 200, nu_url)})
+    monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", lambda *a, **kw: nu_session)
+
+    run_cli(monkeypatch, ["nu-metadata", "--db", db_path], FakeSession({}))
+
+    conn = init_db(db_path)
+    row = conn.execute("SELECT * FROM nu_novels WHERE url = ?", (nu_url,)).fetchone()
+    assert row["fetched_at"] is not None
+    assert row["genres"] == "Action"
+    assert row["tags"] == "Cultivation"
+    assert row["synopsis"] == "A great story."
+    assert iter_nu_novels_missing_details(conn) == []  # resumable: no longer pending
+
+
+def test_cmd_nu_metadata_no_pending_prints_message(monkeypatch, db_path, capsys):
+    run_cli(monkeypatch, ["nu-metadata", "--db", db_path], FakeSession({}))
+    assert "No Novel Updates novels pending a detail fetch" in capsys.readouterr().out
+
+
+def test_cmd_nu_metadata_resolves_session_expiry_mid_run(monkeypatch, db_path):
+    nu_url = f"{NU_BASE_URL}/series/reverend-insanity/"
+    _seed_nu_listing(db_path, nu_url, "Reverend Insanity")
+
+    challenge_html = load_fixture("novelupdates_cloudflare_challenge.html")
+    series_html = nu_series_html(title="Reverend Insanity", associated_names=["Reverend Insanity"])
+
+    call_count = {"n": 0}
+
+    def series_response():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return FakeResponse(challenge_html, 200, nu_url)
+        return FakeResponse(series_html, 200, nu_url)
+
+    nu_session = FakeSession({nu_url: series_response})
+
+    solve_calls = {"n": 0}
+
+    def fake_solve(*a, **kw):
+        solve_calls["n"] += 1
+        return nu_session
+
+    monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", fake_solve)
+
+    run_cli(monkeypatch, ["nu-metadata", "--db", db_path], FakeSession({}))
+
+    assert solve_calls["n"] == 2  # initial solve + one re-solve after the challenge came back
+    conn = init_db(db_path)
+    assert conn.execute(
+        "SELECT fetched_at FROM nu_novels WHERE url = ?", (nu_url,)
+    ).fetchone()["fetched_at"] is not None
+
+
+def test_cmd_nu_metadata_widens_pacer_on_429(monkeypatch, db_path, tmp_path):
+    # Same underlying issue as the old cmd_enrich test this replaces
+    # (confirmed live 2026-08-03: curl_cffi's HTTPError isn't a
     # requests.HTTPError subclass, so fetcher.note_throttle() silently never
-    # matched it. FakeResponse's raise_for_status() raises a real
-    # requests.HTTPError here, but _note_nu_throttle() is duck-typed (checks
-    # .response.status_code, not the exception class), so this exercises the
-    # same code path a real curl_cffi 429 would.
-    _crawl_one(monkeypatch, db_path, "ri1", title="Reverend Insanity")
+    # matches it) -- nu-metadata is now the command doing real per-item NU
+    # network calls, so it's the one that needs this covered.
+    nu_url = f"{NU_BASE_URL}/series/reverend-insanity/"
+    _seed_nu_listing(db_path, nu_url, "Reverend Insanity")
 
-    nu_session = FakeSession({
-        NU_AJAX_URL: FakeResponse("", 429, NU_AJAX_URL),
-    })
+    nu_session = FakeSession({nu_url: FakeResponse("", 429, nu_url)})
     monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", lambda *a, **kw: nu_session)
 
     pacing_file = tmp_path / "pacing.json"
-    run_cli(monkeypatch, ["enrich", "--pacing-file", str(pacing_file), "--db", db_path],
+    run_cli(monkeypatch, ["nu-metadata", "--pacing-file", str(pacing_file), "--db", db_path],
             FakeSession({}))
 
     import json
     pacing = json.loads(pacing_file.read_text())
-    assert pacing["novelupdates"] > 2.5  # default enrich --delay, widened past it
+    assert pacing["novelupdates"] > 2.5  # default nu-metadata --delay, widened past it
+
+
+def test_cmd_nu_metadata_resolves_after_sustained_429s_by_getting_a_fresh_session(monkeypatch, db_path):
+    # 3 back-to-back 429s (MAX_CONSECUTIVE_429S) should force a fresh
+    # session, not just keep widening the pacer forever inside a session
+    # that's evidently now suspect/rate-limited.
+    urls = [f"{NU_BASE_URL}/series/n{i}/" for i in range(4)]
+    conn = init_db(db_path)
+    for i, url in enumerate(urls):
+        upsert_nu_novel_listing(conn, url, f"Novel {i}")
+    conn.commit()
+
+    responses = {url: FakeResponse("", 429, url) for url in urls[:3]}
+    responses[urls[3]] = FakeResponse(nu_series_html(title="Novel 3"), 200, urls[3])
+
+    sessions_created = []
+
+    def fake_solve(*a, **kw):
+        s = FakeSession(responses)
+        sessions_created.append(s)
+        return s
+
+    monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", fake_solve)
+
+    run_cli(monkeypatch, ["nu-metadata", "--db", db_path], FakeSession({}))
+
+    assert len(sessions_created) == 2  # initial session + one forced re-solve after 3 sustained 429s
+    conn = init_db(db_path)
+    fetched = {r["url"] for r in
+               conn.execute("SELECT url FROM nu_novels WHERE fetched_at IS NOT NULL")}
+    assert fetched == {urls[3]}  # only the row fetched after the fresh session landed
+
+
+# -- enrich (now a pure local computation against the crawled nu_novels table) ---
+
+def test_cmd_enrich_resolves_auto_match_purely_locally_no_network(monkeypatch, db_path):
+    # The whole point of this rewrite: no Novel Updates network call anywhere
+    # in `enrich` anymore. FakeSession({}) below has zero stubbed responses,
+    # so if enrich tried to make ANY request through it, FakeSession's strict
+    # mode would raise AssertionError -- this test would fail loudly instead
+    # of silently passing if that regressed.
+    _crawl_one(monkeypatch, db_path, "ri1", title="Reverend Insanity")
+
+    nu_url = f"{NU_BASE_URL}/series/reverend-insanity/"
+    conn = init_db(db_path)
+    upsert_nu_novel_listing(conn, nu_url, "Reverend Insanity")
+    conn.commit()
+    upsert_nu_novel_details(conn, nu_url, NUSeriesMetadata(
+        url=nu_url, title="Reverend Insanity", associated_names=["Reverend Insanity"],
+        genres=["Action"], tags=["Cultivation"], author="Gu Zhen Ren",
+        translation_status="Ongoing", translation_groups=[], release_frequency=None,
+        rating=None, votes=None, synopsis="Some synopsis."))
+    conn.commit()
+
+    run_cli(monkeypatch, ["enrich", "--db", db_path], FakeSession({}))
+
+    conn = init_db(db_path)
+    novel = get_novel(conn, "fanmtl", f"{BASE_URL}/novel/ri1.html")
+    assert novel["nu_resolution"] == "auto"
+    assert novel["nu_url"] == nu_url
+    assert novel["nu_title"] == "Reverend Insanity"
+    assert novel["nu_author"] == "Gu Zhen Ren"
+    tag_names = {row["name"] for row in conn.execute(
+        "SELECT t.name FROM tags t JOIN novel_tags nt ON nt.tag_id = t.id "
+        "WHERE nt.novel_id = ?", (novel["id"],))}
+    assert "Cultivation" in tag_names
+
+
+def test_cmd_enrich_no_local_match_records_no_candidates(monkeypatch, db_path):
+    _crawl_one(monkeypatch, db_path, "obs1", title="Obscure Novel")
+
+    nu_url = f"{NU_BASE_URL}/series/totally-unrelated/"
+    conn = init_db(db_path)
+    upsert_nu_novel_listing(conn, nu_url, "Totally Unrelated")
+    conn.commit()
+    upsert_nu_novel_details(conn, nu_url, NUSeriesMetadata(
+        url=nu_url, title="Totally Unrelated", associated_names=["Totally Unrelated"],
+        genres=[], tags=[], author=None, translation_status=None, translation_groups=[],
+        release_frequency=None, rating=None, votes=None, synopsis=None))
+    conn.commit()
+
+    run_cli(monkeypatch, ["enrich", "--db", db_path], FakeSession({}))
+
+    conn = init_db(db_path)
+    novel = get_novel(conn, "fanmtl", f"{BASE_URL}/novel/obs1.html")
+    assert novel["nu_resolution"] == "no_candidates"
+    assert novel["nu_url"] is None
+
+
+def test_cmd_enrich_no_resolved_nu_novels_prints_message(monkeypatch, db_path, capsys):
+    _crawl_one(monkeypatch, db_path, "ri1", title="Reverend Insanity")
+    # nu_novels is completely empty -- neither nu-crawl nor nu-metadata has run.
+    run_cli(monkeypatch, ["enrich", "--db", db_path], FakeSession({}))
+    out = capsys.readouterr().out
+    assert "nu-crawl" in out and "nu-metadata" in out
 
 
 def test_cmd_enrich_no_pending_candidates_prints_message(monkeypatch, db_path, capsys):
