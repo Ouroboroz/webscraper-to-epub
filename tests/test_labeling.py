@@ -1,7 +1,8 @@
 from epub_scraper.dataspine_db import (get_label, get_novel, init_db, recompute_candidates,
                                         upsert_catalog_entry, upsert_embedding, upsert_label)
-from epub_scraper.labeling import (build_seed_queue, next_review_candidate, rank_by_uncertainty,
-                                    record_label, search_novels, train_uncertainty_model)
+from epub_scraper.labeling import (_interleave_proportionally, build_seed_queue,
+                                    next_review_candidate, rank_by_uncertainty, record_label,
+                                    search_novels, train_uncertainty_model)
 from test_dataspine_db import make_entry
 
 SITE = "fanmtl"
@@ -32,7 +33,7 @@ def _add_candidate(conn, url, title, cluster_id=None, embedding=None):
     return novel["id"]
 
 
-def _add_labeled_novel(conn, url, title, embedding, label):
+def _add_labeled_novel(conn, url, title, embedding, label, source="cold"):
     """A novel with an embedding and an existing label -- training data for
     train_uncertainty_model. Deliberately not run through
     recompute_candidates/cluster_id: already-labeled novels are excluded from
@@ -43,7 +44,7 @@ def _add_labeled_novel(conn, url, title, embedding, label):
     conn.commit()
     novel = get_novel(conn, SITE, url)
     upsert_embedding(conn, novel["id"], _embedding_bytes(*embedding))
-    upsert_label(conn, novel["id"], label, source="cold")
+    upsert_label(conn, novel["id"], label, source=source)
     conn.commit()
     return novel["id"]
 
@@ -102,20 +103,63 @@ def test_search_novels_respects_limit(db_path):
     assert len(search_novels(conn, SITE, "Novel", limit=3)) == 3
 
 
+# -- _interleave_proportionally ----------------------------------------------------
+
+def test_interleave_proportionally_spreads_each_bucket_by_its_own_density(db_path):
+    # bucket0 (4 items) at positions .25/.5/.75/1.0, bucket1 (2 items) at
+    # .5/1.0 -- ties broken by bucket order. B1 lands in the MIDDLE, not
+    # bunched at the start or the end, proving this isn't plain round-robin
+    # (which would give exactly one full round of [A,B] before any bucket
+    # gets a second item) or drain-then-next (which would put both B's
+    # together at one end).
+    result = _interleave_proportionally([["A1", "A2", "A3", "A4"], ["B1", "B2"]])
+    assert result == ["A1", "A2", "B1", "A3", "A4", "B2"]
+
+
+def test_interleave_proportionally_skips_empty_buckets(db_path):
+    assert _interleave_proportionally([[], ["A1"], []]) == ["A1"]
+
+
+def test_interleave_proportionally_empty_input(db_path):
+    assert _interleave_proportionally([]) == []
+
+
 # -- build_seed_queue --------------------------------------------------------------
 
-def test_build_seed_queue_interleaves_round_robin_across_clusters(db_path):
+def test_build_seed_queue_weights_outliers_by_their_share_of_the_corpus(db_path):
+    # 2026-08-03 finding: outliers (-1) were 56.6% of the real corpus but,
+    # under the old equal-weight-per-bucket design, only ever got ~4% of a
+    # 200-label session's slots -- the numeric majority of what Stage 3 will
+    # actually have to score got almost no direct labeling coverage. Here:
+    # 4 outliers / 8 total candidates = 50%, total_target=8 -> outlier_quota
+    # should be round(8 * 4/8) = 4, i.e. ALL of them, not capped down to
+    # some small fixed per-cluster number.
     conn = init_db(db_path)
-    a1 = _add_candidate(conn, "https://x/a1.html", "A1", cluster_id=-1)
-    a2 = _add_candidate(conn, "https://x/a2.html", "A2", cluster_id=-1)
-    b1 = _add_candidate(conn, "https://x/b1.html", "B1", cluster_id=0)
-    b2 = _add_candidate(conn, "https://x/b2.html", "B2", cluster_id=0)
-    b3 = _add_candidate(conn, "https://x/b3.html", "B3", cluster_id=0)
-    c1 = _add_candidate(conn, "https://x/c1.html", "C1", cluster_id=1)
+    outlier_ids = {_add_candidate(conn, f"https://x/out{i}.html", f"Out{i}", cluster_id=-1)
+                   for i in range(4)}
+    cluster_a_ids = {_add_candidate(conn, f"https://x/a{i}.html", f"A{i}", cluster_id=0)
+                      for i in range(2)}
+    cluster_b_ids = {_add_candidate(conn, f"https://x/b{i}.html", f"B{i}", cluster_id=1)
+                      for i in range(2)}
 
-    # Round-robin, not "drain cluster -1, then 0, then 1": one from each
-    # cluster in turn, shorter clusters simply drop out of later rounds.
-    assert build_seed_queue(conn, SITE) == [a1, b1, c1, a2, b2, b3]
+    queue = build_seed_queue(conn, SITE, total_target=8)
+
+    assert set(queue) == outlier_ids | cluster_a_ids | cluster_b_ids
+    assert sum(1 for n in queue if n in outlier_ids) == 4
+    assert sum(1 for n in queue if n in cluster_a_ids) == 2
+    assert sum(1 for n in queue if n in cluster_b_ids) == 2
+
+
+def test_build_seed_queue_gives_every_real_cluster_at_least_one_slot(db_path):
+    # A tight total_target split across many real clusters could round down
+    # to 0 per cluster -- max(1, ...) guarantees every theme still gets
+    # touched, which was this queue's original whole purpose.
+    conn = init_db(db_path)
+    ids = [_add_candidate(conn, f"https://x/{i}.html", f"N{i}", cluster_id=i) for i in range(20)]
+
+    queue = build_seed_queue(conn, SITE, total_target=1)
+
+    assert set(queue) == set(ids)
 
 
 def test_build_seed_queue_excludes_already_labeled_novels(db_path):
@@ -126,13 +170,6 @@ def test_build_seed_queue_excludes_already_labeled_novels(db_path):
     conn.commit()
 
     assert build_seed_queue(conn, SITE) == [b]
-
-
-def test_build_seed_queue_respects_per_cluster_cap(db_path):
-    conn = init_db(db_path)
-    ids = [_add_candidate(conn, f"https://x/{i}.html", f"N{i}", cluster_id=0) for i in range(5)]
-
-    assert build_seed_queue(conn, SITE, per_cluster=2) == ids[:2]
 
 
 def test_build_seed_queue_excludes_non_candidates_and_unclustered(db_path):
@@ -152,6 +189,11 @@ def test_build_seed_queue_excludes_non_candidates_and_unclustered(db_path):
     _add_candidate(conn, "https://x/unclustered.html", "Unclustered", cluster_id=None)
 
     assert build_seed_queue(conn, SITE) == [good]
+
+
+def test_build_seed_queue_empty_when_no_candidates(db_path):
+    conn = init_db(db_path)
+    assert build_seed_queue(conn, SITE) == []
 
 
 # -- train_uncertainty_model --------------------------------------------------------
@@ -191,6 +233,29 @@ def test_train_uncertainty_model_fits_once_labels_span_both_classes(db_path):
     proba_meh = model.predict_proba(np.array([[-5.0, -5.0]], dtype=np.float32))[0][1]
     assert proba_like > 0.5
     assert proba_meh < 0.5
+
+
+def test_train_uncertainty_model_weights_read_labels_above_cold_ones(db_path):
+    # A single 'read' (actually finished, real ground truth) "like" sits
+    # right in the middle of a cluster of 'cold' (synopsis-only guess)
+    # "meh" labels -- a real disagreement between weak-but-plentiful signal
+    # and strong-but-single signal. At the default weighting the read label
+    # should be able to outvote the surrounding cold ones for its own point;
+    # with no extra weight at all it can't.
+    conn = init_db(db_path)
+    for i, coord in enumerate([(-5, -5), (-4.8, -4.8), (-4.6, -4.6), (-4.4, -4.4)]):
+        _add_labeled_novel(conn, f"https://x/meh{i}.html", f"Meh{i}", list(coord), "meh")
+    _add_labeled_novel(conn, "https://x/like.html", "Like", [5.0, 5.0], "like")
+    _add_labeled_novel(conn, "https://x/read.html", "Read", [-4.5, -4.5], "like", source="read")
+
+    import numpy as np
+    probe = np.array([[-4.5, -4.5]], dtype=np.float32)
+
+    unweighted = train_uncertainty_model(conn, SITE, read_weight=1.0)
+    assert unweighted.predict_proba(probe)[0][1] < 0.5
+
+    weighted = train_uncertainty_model(conn, SITE, read_weight=10.0)
+    assert weighted.predict_proba(probe)[0][1] > 0.5
 
 
 # -- rank_by_uncertainty ------------------------------------------------------------
