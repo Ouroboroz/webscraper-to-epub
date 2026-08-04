@@ -27,6 +27,7 @@ Stage 3's actual classifier -- it exists purely to pick which unlabeled
 novel is most worth asking about next.
 """
 
+import heapq
 import itertools
 
 from .dataspine_db import (DEFAULT_DB_PATH, count_labels, delete_most_recent_label,
@@ -52,17 +53,73 @@ def search_novels(conn, site_key, query, limit=20):
     ).fetchall()
 
 
-def build_seed_queue(conn, site_key, per_cluster=8):
-    """Cluster-stratified, round-robin-interleaved list of unlabeled
-    novel_ids with a known cluster_id -- up to `per_cluster` from each
-    cluster (outliers/-1 counted as their own bucket). Round-robin (one from
-    each cluster in turn, not all of cluster 0 then all of cluster 1...) so
-    a short labeling session still touches most of the taste space instead
-    of exhausting one cluster first.
+def _interleave_proportionally(buckets):
+    """Merge several already size-capped id lists into one queue where each
+    bucket's items are spread evenly across the WHOLE output in proportion
+    to that bucket's own size, rather than round-robin (which gives every
+    bucket equal weight per round, drastically under-representing a bucket
+    that's deliberately sized much bigger than the others) or draining one
+    bucket before the next (which front-loads it instead of spreading it).
+
+    A bucket of size N gets its k-th item (0-indexed) placed at fractional
+    position (k+1)/N in the merge order; globally sorting all items by that
+    fraction interleaves every bucket at its own density throughout the
+    whole sequence -- so a short prefix of the result already reflects each
+    bucket's intended share, not just the eventual full drain."""
+    heap = []
+    for bidx, items in enumerate(buckets):
+        if items:
+            heapq.heappush(heap, (1.0 / len(items), bidx, 0))
+
+    queue = []
+    while heap:
+        pos, bidx, idx = heapq.heappop(heap)
+        items = buckets[bidx]
+        queue.append(items[idx])
+        idx += 1
+        if idx < len(items):
+            heapq.heappush(heap, (pos + 1.0 / len(items), bidx, idx))
+    return queue
+
+
+def build_seed_queue(conn, site_key, total_target=LABEL_TARGET):
+    """Cluster-stratified list of unlabeled novel_ids with a known
+    cluster_id, sized and interleaved so a session of about `total_target`
+    labels touches every real theme Stage 1 found AND gets outliers (-1)
+    represented close to their actual share of the corpus.
+
+    Confirmed live (2026-08-03) this needs deliberate handling, not plain
+    equal-weight round-robin: on the real corpus, -1 alone was 56.6% of all
+    candidates (59,398 of 104,954) spread across zero coherent themes,
+    against 122 real clusters. Equal per-bucket round-robin (the original
+    design here) gives -1 the SAME weight as any single 15-novel niche
+    cluster -- with 123 buckets total and a ~200-label target, that's ~8
+    outlier labels out of 200 (4%) for a bucket that's the numeric majority
+    of the corpus Stage 3 will actually have to score later.
+
+    Built in two levels, deliberately NOT by handing _interleave_proportionally
+    123 buckets directly (tried that first -- confirmed live it silently
+    clumps: with total_target=200 spread over 122 real clusters, each ends
+    up sized 1, and EVERY size-1 bucket's single item lands at the exact
+    same fractional position [1.0] in that function's math, so all 122 pile
+    up together at the very end while the one outlier bucket -- the only
+    one with more than 1 item -- occupies the entire rest of the sequence
+    alone. Degenerate, not proportional, the opposite of the goal.):
+    1. Round-robin ONLY across the real clusters into one combined stream
+       (up to `per_cluster` from each -- already naturally diverse, since
+       every item in it comes from a different theme).
+    2. Interleave that ONE combined stream against the outlier bucket --
+       now just two comparably-sized buckets, which
+       _interleave_proportionally handles correctly (see its own docstring
+       and tests) -- sized so outliers land at their live share of
+       (outliers + however many real-cluster slots the >=1-per-cluster
+       floor actually produced), not diluted by that floor the way sizing
+       directly off `total_target` would be.
 
     Recomputed fresh on every call rather than cached -- cheap (a handful of
-    SQL queries at this row count) and automatically correct as labels land,
-    with no "where was I" state to track across requests."""
+    SQL queries at this row count) and automatically correct as labels land
+    or Stage 1 gets re-run with different clustering, with no "where was I"
+    state to track across requests."""
     labeled = iter_labeled_novel_ids(conn)
     rows = conn.execute(
         "SELECT id, cluster_id FROM novels "
@@ -77,25 +134,54 @@ def build_seed_queue(conn, site_key, per_cluster=8):
             continue
         by_cluster.setdefault(row["cluster_id"], []).append(row["id"])
 
-    buckets = [ids[:per_cluster] for ids in by_cluster.values()]
-    queue = []
-    for group in itertools.zip_longest(*buckets):
-        queue.extend(novel_id for novel_id in group if novel_id is not None)
-    return queue
+    outlier_ids = by_cluster.pop(-1, [])
+    real_cluster_lists = list(by_cluster.values())
+    n_real = len(real_cluster_lists)
+
+    # True population share -- from the FULL (uncapped) counts, not the
+    # per_cluster-capped ones below, which are a small sample of the real
+    # clusters and would badly overstate outliers' share if used here
+    # (confirmed live: using the capped counts put outliers at 99.8% of the
+    # queue instead of the intended ~57%).
+    n_total = len(outlier_ids) + sum(len(ids) for ids in real_cluster_lists)
+    outlier_fraction = len(outlier_ids) / n_total if n_total else 0
+
+    per_cluster = max(1, total_target // n_real) if n_real else 0
+    real_capped = [ids[:per_cluster] for ids in real_cluster_lists]
+    real_combined = [novel_id for group in itertools.zip_longest(*real_capped)
+                      for novel_id in group if novel_id is not None]
+    if 0 < outlier_fraction < 1:
+        outlier_quota = round(len(real_combined) * outlier_fraction / (1 - outlier_fraction))
+    else:
+        outlier_quota = len(outlier_ids)  # all-outlier or all-real-cluster corpus -- no split to do
+
+    return _interleave_proportionally([outlier_ids[:outlier_quota], real_combined])
 
 
-def train_uncertainty_model(conn, site_key):
+def train_uncertainty_model(conn, site_key, read_weight=2.0):
     """Fit a quick LogisticRegression over every labeled novel's synopsis
     embedding, binarized Like=1 / Meh+Drop=0 (matching the settled Stage 3
     binarization rule). Returns None if there aren't at least two labels
     with both classes represented yet -- can't fit a real decision boundary
     from one class, and the seed queue should still be the one driving
-    selection at that point anyway."""
+    selection at that point anyway.
+
+    read_weight: sample_weight multiplier for source='read' labels (books
+    actually read) relative to 1.0 for source='cold' ones (judged from
+    synopsis/tags alone). A 'read' label is real ground truth; a 'cold' one
+    is a real but noisier signal -- the module docstring's own framing.
+    2.0 is a deliberately moderate default, not maxed out: 'cold' labels
+    are how most of the 150-250 target actually gets hit (see module
+    docstring), so a much higher multiplier would let a likely-small set of
+    'read' labels dominate the fit and defeat the point of that broader
+    cold-labeled coverage. This is an internal active-learning helper, not
+    Stage 3's actual classifier -- revisit there with more labels in hand
+    once that's real, rather than treating this number as load-bearing."""
     import numpy as np
     from sklearn.linear_model import LogisticRegression
 
     rows = conn.execute(
-        "SELECT n.synopsis_embedding AS embedding, l.label AS label "
+        "SELECT n.synopsis_embedding AS embedding, l.label AS label, l.source AS source "
         "FROM novels n JOIN labels l ON l.novel_id = n.id "
         "WHERE n.site_key = ? AND n.synopsis_embedding IS NOT NULL",
         (site_key,),
@@ -108,8 +194,9 @@ def train_uncertainty_model(conn, site_key):
         return None
 
     X = np.stack([np.frombuffer(row["embedding"], dtype=np.float32) for row in rows])
+    sample_weight = [read_weight if row["source"] == "read" else 1.0 for row in rows]
     model = LogisticRegression(max_iter=1000)
-    model.fit(X, y)
+    model.fit(X, y, sample_weight=sample_weight)
     return model
 
 
