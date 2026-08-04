@@ -235,6 +235,22 @@ def test_train_uncertainty_model_fits_once_labels_span_both_classes(db_path):
     assert proba_meh < 0.5
 
 
+def test_train_uncertainty_model_treats_love_and_obsessed_as_positive(db_path):
+    # POSITIVE_LABELS = {like, love, obsessed} -- all three should land on
+    # the same side of the binarization as 'like', not just 'like' itself.
+    conn = init_db(db_path)
+    _add_labeled_novel(conn, "https://x/love.html", "Love", [5.0, 5.0], "love")
+    _add_labeled_novel(conn, "https://x/obsessed.html", "Obsessed", [4.9, 4.9], "obsessed")
+    _add_labeled_novel(conn, "https://x/skip.html", "Skip", [-5.0, -5.0], "skip")
+    _add_labeled_novel(conn, "https://x/drop.html", "Drop", [-4.9, -4.9], "drop")
+
+    import numpy as np
+    model = train_uncertainty_model(conn, SITE)
+    assert model is not None
+    assert model.predict_proba(np.array([[5.0, 5.0]], dtype=np.float32))[0][1] > 0.5
+    assert model.predict_proba(np.array([[-5.0, -5.0]], dtype=np.float32))[0][1] < 0.5
+
+
 def test_train_uncertainty_model_weights_read_labels_above_cold_ones(db_path):
     # A single 'read' (actually finished, real ground truth) "like" sits
     # right in the middle of a cluster of 'cold' (synopsis-only guess)

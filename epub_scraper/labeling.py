@@ -1,8 +1,18 @@
 """
 epub_scraper.labeling -- Stage 2 of the classification data spine: gather the
-150-250 Like/Meh/Drop labels everything downstream (the classifier, ranked
-serving) depends on. There are zero labels before this stage; that's the
-whole reason it exists.
+150-250 labels everything downstream (the classifier, ranked serving)
+depends on. There are zero labels before this stage; that's the whole
+reason it exists.
+
+Labels are a 6-tier ordinal scale (dataspine_db.LABEL_ORDER: Skip, Drop,
+Meh, Like, Love, Obsessed), not a flat Like/Meh/Drop -- "did I even try
+it" and "how strongly" both carry real signal (e.g. checking obsessively
+for updates on a 'read' novel vs. rarely bothering is itself a taste
+signal, even though the app has no way to observe that automatically --
+the tiered scale is how you get to record it yourself). 'Skip' only
+applies to source='cold' judgments (you can't skip something you've
+already read). Stage 3 binarizes via dataspine_db.POSITIVE_LABELS
+(Like/Love/Obsessed=1, everything else=0).
 
 Two ways to add a label, both writing to the same `labels` table
 (dataspine_db.py) distinguished by `source`:
@@ -30,10 +40,10 @@ novel is most worth asking about next.
 import heapq
 import itertools
 
-from .dataspine_db import (DEFAULT_DB_PATH, count_labels, delete_most_recent_label,
-                            first_chapter_excerpt, get_novel_by_id, init_db, iter_embeddings,
-                            iter_labeled_novel_ids, label_counts_by_type, tags_for_novel,
-                            upsert_label)
+from .dataspine_db import (DEFAULT_DB_PATH, LABEL_ORDER, POSITIVE_LABELS, count_labels,
+                            delete_most_recent_label, first_chapter_excerpt, get_novel_by_id,
+                            init_db, iter_embeddings, iter_labeled_novel_ids, label_counts_by_type,
+                            tags_for_novel, upsert_label)
 
 SITE_KEY = "fanmtl"
 DEFAULT_PORT = 5001
@@ -160,9 +170,10 @@ def build_seed_queue(conn, site_key, total_target=LABEL_TARGET):
 
 def train_uncertainty_model(conn, site_key, read_weight=2.0):
     """Fit a quick LogisticRegression over every labeled novel's synopsis
-    embedding, binarized Like=1 / Meh+Drop=0 (matching the settled Stage 3
-    binarization rule). Returns None if there aren't at least two labels
-    with both classes represented yet -- can't fit a real decision boundary
+    embedding, binarized per dataspine_db.POSITIVE_LABELS (Like/Love/
+    Obsessed=1, Skip/Drop/Meh=0 -- the settled Stage 3 binarization rule
+    over the full 6-tier scale). Returns None if there aren't at least two
+    labels with both classes represented yet -- can't fit a real decision boundary
     from one class, and the seed queue should still be the one driving
     selection at that point anyway.
 
@@ -189,7 +200,7 @@ def train_uncertainty_model(conn, site_key, read_weight=2.0):
     if len(rows) < 2:
         return None
 
-    y = [1 if row["label"] == "like" else 0 for row in rows]
+    y = [1 if row["label"] in POSITIVE_LABELS else 0 for row in rows]
     if len(set(y)) < 2:
         return None
 
@@ -265,7 +276,8 @@ _CSS = """
   --bg: #0d1017; --surface: #171b24; --surface-2: #1e2330; --border: #2a2f3a;
   --text: #e8e6e1; --text-dim: #9aa0ac; --text-faint: #5b6472;
   --accent: #e8a33d; --accent-ink: #1a1204;
-  --like: #6fae6f; --meh: #c9a227; --drop: #c96a4a;
+  --skip: #6b7280; --drop: #c96a4a; --meh: #c9a227;
+  --like: #6fae6f; --love: #4fb0c6; --obsessed: #b57bd6;
   --focus-ring: #e8a33d;
 }
 @media (prefers-color-scheme: light) {
@@ -342,9 +354,12 @@ button {
 }
 button:hover { border-color: var(--accent); }
 button:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
-button.like:hover { border-color: var(--like); color: var(--like); }
-button.meh:hover { border-color: var(--meh); color: var(--meh); }
+button.skip:hover { border-color: var(--skip); color: var(--skip); }
 button.drop:hover { border-color: var(--drop); color: var(--drop); }
+button.meh:hover { border-color: var(--meh); color: var(--meh); }
+button.like:hover { border-color: var(--like); color: var(--like); }
+button.love:hover { border-color: var(--love); color: var(--love); }
+button.obsessed:hover { border-color: var(--obsessed); color: var(--obsessed); }
 button.ghost { background: transparent; color: var(--text-faint); font-size: 0.76rem; }
 .kbd { font-size: 0.7rem; color: var(--text-faint); margin-left: 0.3rem; }
 input[type=text], input[type=number] {
@@ -367,7 +382,7 @@ _KEYBOARD_JS = """
 document.body.addEventListener('keydown', function (e) {
   var tag = (e.target.tagName || '').toLowerCase();
   if (tag === 'input' || tag === 'textarea') return;
-  var map = {'1': 'like', '2': 'meh', '3': 'drop'};
+  var map = {'1': 'skip', '2': 'drop', '3': 'meh', '4': 'like', '5': 'love', '6': 'obsessed'};
   var kind = map[e.key];
   if (!kind) return;
   var btn = document.querySelector('.actions button.' + kind);
@@ -379,7 +394,7 @@ document.body.addEventListener('keydown', function (e) {
 def _progress(conn):
     counts = label_counts_by_type(conn)
     total = count_labels(conn)
-    parts = ", ".join(f"{counts.get(k, 0)} {k}" for k in ("like", "meh", "drop") if counts.get(k))
+    parts = ", ".join(f"{counts.get(k, 0)} {k}" for k in LABEL_ORDER if counts.get(k))
     return f"{total}/{LABEL_TARGET} labeled" + (f" ({parts})" if parts else "")
 
 
@@ -434,12 +449,33 @@ def _progress_oob(conn):
     return Div(_progress(conn), cls="progress", id="progress", hx_swap_oob="true")
 
 
+_LABEL_DISPLAY = {"skip": "Skip", "drop": "Drop", "meh": "Meh",
+                   "like": "Like", "love": "Love", "obsessed": "Obsessed"}
+_LABEL_KEY = {"skip": "1", "drop": "2", "meh": "3", "like": "4", "love": "5", "obsessed": "6"}
+
+
+def _label_buttons(labels, *, show_keys):
+    """Button+keyboard-hint pairs for `labels` (a subset/ordering of
+    dataspine_db.LABEL_ORDER) -- shared between the review queue (all 6
+    tiers) and the read-a-book flow (5 -- 'skip' doesn't apply to a novel
+    you've actually read)."""
+    from fasthtml.common import Button, Span
+
+    bits = []
+    for label in labels:
+        bits.append(Button(_LABEL_DISPLAY[label], cls=label, type="submit",
+                            name="label", value=label))
+        if show_keys:
+            bits.append(Span(_LABEL_KEY[label], cls="kbd"))
+    return bits
+
+
 def _queue_card(conn, skipped_ids):
     """Just the swappable panel -- id="queue-panel", no OOB sibling. Used
     both for the initial full-page render (where the header's own _progress()
     call already has the right count) and, wrapped alongside
-    _progress_oob(), for the AJAX follow-ups after a label/skip/undo."""
-    from fasthtml.common import Button, Div, Form, Hidden, Span
+    _progress_oob(), for the AJAX follow-ups after a label/later/undo."""
+    from fasthtml.common import Button, Div, Form, Hidden
 
     candidate = next_review_candidate(conn, SITE_KEY, skipped_ids=skipped_ids)
     if candidate is None:
@@ -450,19 +486,16 @@ def _queue_card(conn, skipped_ids):
             _novel_display(conn, candidate),
             Form(
                 Hidden(name="novel_id", value=str(candidate["id"])),
-                Div(
-                    Button("Like", cls="like", type="submit", name="label", value="like"),
-                    Span("1", cls="kbd"),
-                    Button("Meh", cls="meh", type="submit", name="label", value="meh"),
-                    Span("2", cls="kbd"),
-                    Button("Drop", cls="drop", type="submit", name="label", value="drop"),
-                    Span("3", cls="kbd"),
-                    cls="actions",
-                ),
+                Div(*_label_buttons(LABEL_ORDER, show_keys=True), cls="actions"),
                 hx_post="/queue/label", hx_target="#queue-panel", hx_swap="outerHTML",
             ),
             Div(
-                Button("Skip", cls="ghost", hx_post="/queue/skip",
+                # "Later" (ephemeral, this-session-only, not a judgment) is
+                # deliberately distinct from the "Skip" LABEL button above
+                # (a real persisted "wouldn't even start this" verdict) --
+                # this just re-queues the candidate for a future session
+                # without recording any opinion at all.
+                Button("Later", cls="ghost", hx_post="/queue/skip",
                        hx_vals=f'{{"novel_id": {candidate["id"]}}}',
                        hx_target="#queue-panel", hx_swap="outerHTML"),
                 Button("Undo last label", cls="ghost", hx_post="/queue/undo",
@@ -500,16 +533,17 @@ def _search_results(conn, query):
 
 
 def _read_detail(conn, novel):
-    from fasthtml.common import Button, Div, Form, Hidden, Input, Label
+    from fasthtml.common import Div, Form, Hidden, Input, Label
 
+    # No "skip" here -- that tier means "wouldn't even start this from the
+    # synopsis alone", which doesn't apply to a novel you've actually read.
+    read_labels = [label for label in LABEL_ORDER if label != "skip"]
     return Div(
         _novel_display(conn, novel),
         Form(
             Hidden(name="novel_id", value=str(novel["id"])),
             Div(
-                Button("Like", cls="like", type="submit", name="label", value="like"),
-                Button("Meh", cls="meh", type="submit", name="label", value="meh"),
-                Button("Drop", cls="drop", type="submit", name="label", value="drop"),
+                *_label_buttons(read_labels, show_keys=False),
                 Div(Label("Dropped at chapter"),
                     Input(type="number", name="drop_chapter", min="0"),
                     cls="drop-chapter-field"),

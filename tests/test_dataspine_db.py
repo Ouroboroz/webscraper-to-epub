@@ -1,6 +1,6 @@
 import pytest
 
-from epub_scraper.dataspine_db import (all_resolved_nu_novels, all_tags, count_labels,
+from epub_scraper.dataspine_db import (LABEL_ORDER, all_resolved_nu_novels, all_tags, count_labels,
                                         delete_most_recent_label, first_chapter_excerpt,
                                         get_next_page, get_novel, get_novel_by_id, get_nu_novel,
                                         init_db, iter_candidates_missing_chapters,
@@ -669,6 +669,30 @@ def test_upsert_label_overwrites_on_relabel(db_path):
     assert rows[0]["label"] == "drop"
     assert rows[0]["drop_chapter"] == 7
     assert rows[0]["source"] == "read"
+
+
+def test_upsert_label_accepts_every_label_in_the_ordinal_scale(db_path):
+    conn = init_db(db_path)
+    for i, label in enumerate(LABEL_ORDER):
+        upsert_catalog_entry(conn, make_entry(f"https://x/novel/{i}.html", 100, title=f"N{i}"),
+                              site_key="fanmtl")
+        conn.commit()
+        novel = get_novel(conn, "fanmtl", f"https://x/novel/{i}.html")
+        upsert_label(conn, novel["id"], label, source="cold")
+    conn.commit()
+
+    stored = {row["label"] for row in conn.execute("SELECT label FROM labels")}
+    assert stored == set(LABEL_ORDER)
+
+
+def test_upsert_label_rejects_an_unknown_label(db_path):
+    conn = init_db(db_path)
+    upsert_catalog_entry(conn, make_entry("https://x/novel/a.html", 100, title="A"), site_key="fanmtl")
+    conn.commit()
+    novel = get_novel(conn, "fanmtl", "https://x/novel/a.html")
+
+    with pytest.raises(ValueError):
+        upsert_label(conn, novel["id"], "loved-it", source="cold")
 
 
 def test_count_labels_and_label_counts_by_type(db_path):

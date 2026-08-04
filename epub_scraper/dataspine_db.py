@@ -616,11 +616,27 @@ def write_tag_communities(conn, communities):
     )
 
 
+#: Ordinal, low-to-high engagement/preference scale -- deliberately not just
+#: valence (dislike/neutral/like), because "did I even try it" and "how
+#: strongly" both carry real signal on their own (2026-08-04 design: a
+#: flat Like/Meh/Drop was found too coarse once actual labeling started).
+#: 'skip' is a real judgment ("wouldn't even start this, from the synopsis
+#: alone") distinct from 'drop' ("I actually started reading and stopped")
+#: -- 'skip' only makes sense for source='cold' labels, never source='read'
+#: (you can't skip something you already read).
+LABEL_ORDER = ("skip", "drop", "meh", "like", "love", "obsessed")
+#: Stage 3's (and train_uncertainty_model's) binarization rule: which tiers
+#: count as the positive class. Everything else (skip/drop/meh) is 0.
+POSITIVE_LABELS = frozenset({"like", "love", "obsessed"})
+
+
 def upsert_label(conn, novel_id, label, drop_chapter=None, source="cold"):
-    """label: 'like' | 'meh' | 'drop'. drop_chapter only makes sense for a
+    """label: one of LABEL_ORDER. drop_chapter only makes sense for a
     'drop' recorded from source='read' -- a 'cold' judgment (never actually
     read) has no chapter to attach. One label per novel; re-labeling
     overwrites (upsert), same convention as upsert_metadata etc."""
+    if label not in LABEL_ORDER:
+        raise ValueError(f"label must be one of {LABEL_ORDER}, got {label!r}")
     conn.execute(
         """
         INSERT INTO labels (novel_id, label, drop_chapter, source, labeled_at)
