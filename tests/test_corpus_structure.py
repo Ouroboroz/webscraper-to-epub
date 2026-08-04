@@ -84,6 +84,91 @@ def test_cluster_corpus_separates_two_well_separated_blobs(db_path):
     assert a_clusters.isdisjoint(b_clusters)
 
 
+def test_cluster_corpus_recovers_a_small_niche_hiding_in_the_outliers(db_path):
+    # Mirrors what happened on the real corpus (2026-08-03): a small, tight
+    # niche group that's too small to compete against a big dense cluster in
+    # the FULL-corpus pass, but forms an obvious cluster once whatever's left
+    # as -1 gets a second look on its own.
+    import numpy as np
+
+    conn = init_db(db_path)
+    rng = np.random.default_rng(0)
+    dim = 16
+
+    big_ids = [_add_embedded_novel(conn, f"https://x/big{i}.html", f"Big{i}",
+                                    rng.normal(loc=0.0, scale=0.05, size=dim))
+               for i in range(30)]
+    niche_ids = [_add_embedded_novel(conn, f"https://x/niche{i}.html", f"Niche{i}",
+                                      rng.normal(loc=20.0, scale=0.05, size=dim))
+                 for i in range(8)]
+    scattered_ids = [_add_embedded_novel(conn, f"https://x/scat{i}.html", f"Scat{i}",
+                                          rng.normal(loc=-20.0 * (i + 1), scale=0.01, size=dim))
+                      for i in range(4)]
+
+    n, n_clusters, n_outliers = corpus_structure.cluster_corpus(
+        conn, "fanmtl", umap_dims=4, min_cluster_size=10,
+        outlier_min_cluster_size=3, outlier_max_cluster_fraction=0.5)
+
+    assert n == 30 + 8 + 4
+    rows = {r["id"]: r["cluster_id"] for r in conn.execute("SELECT id, cluster_id FROM novels")}
+
+    # The niche group (too small for the main min_cluster_size=10 pass) was
+    # left as -1 by the main pass but must be recovered as its own cluster,
+    # distinct from the big cluster, by the second pass.
+    big_clusters = {rows[i] for i in big_ids if rows[i] != -1}
+    niche_clusters = {rows[i] for i in niche_ids}
+    assert -1 not in niche_clusters, "the niche group should have been recovered, not left as outliers"
+    assert len(niche_clusters) == 1
+    assert niche_clusters.isdisjoint(big_clusters)
+
+    # The truly one-off scattered novels (nothing near them, even amongst
+    # each other) must stay outliers -- the second pass shouldn't force
+    # everything into some cluster.
+    for i in scattered_ids:
+        assert rows[i] == -1
+
+
+def test_recluster_outliers_keeps_small_sub_cluster_but_discards_oversized_one():
+    import numpy as np
+
+    from epub_scraper.corpus_structure import _recluster_outliers
+
+    rng = np.random.default_rng(0)
+    dim = 16
+    # Same well-separated-blobs recipe already proven reliable elsewhere in
+    # this file. Within the outlier set: a small sub-group (4 points, 20% of
+    # the 20 outliers) that should be recovered as real structure, and a
+    # bigger one (16 points, 80%) standing in for the density-chained
+    # mega-cluster artifact seen on the real corpus -- max_cluster_fraction
+    # (0.5) sits between the two, so exactly one should survive.
+    main_pass = rng.normal(loc=-40.0, scale=0.05, size=(5, dim))
+    small_sub = rng.normal(loc=0.0, scale=0.05, size=(4, dim))
+    big_sub = rng.normal(loc=20.0, scale=0.05, size=(16, dim))
+    reduced = np.vstack([main_pass, small_sub, big_sub])
+    cluster_ids = np.array([0] * 5 + [-1] * 20)
+
+    result = _recluster_outliers(reduced, cluster_ids, min_cluster_size=2, max_cluster_fraction=0.5)
+
+    assert (result[:5] == 0).all()  # the main pass's assignments are untouched
+    small_result = result[5:9]
+    big_result = result[9:]
+    assert (small_result != -1).all(), "the small real sub-cluster should have been recovered"
+    assert len(set(small_result.tolist())) == 1
+    assert small_result[0] != 0  # a new ID, not colliding with the main pass's cluster 0
+    assert (big_result == -1).all(), "the oversized sub-cluster should be treated as an artifact"
+
+
+def test_recluster_outliers_noop_when_too_few_outliers_to_bother():
+    import numpy as np
+
+    from epub_scraper.corpus_structure import _recluster_outliers
+
+    cluster_ids = np.array([0, 0, 0, -1, -1])  # only 2 outliers, min_cluster_size=15
+    result = _recluster_outliers(np.zeros((5, 3)), cluster_ids, min_cluster_size=15)
+
+    assert (result == cluster_ids).all()
+
+
 # -- build_tag_communities ---------------------------------------------------------
 
 def test_build_tag_communities_no_tags_returns_zero(db_path):
