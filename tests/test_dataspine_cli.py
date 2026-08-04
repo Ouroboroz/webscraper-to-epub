@@ -139,6 +139,67 @@ def test_cmd_crawl_stops_cleanly_on_404_without_retrying(monkeypatch, db_path, t
     assert get_next_page(conn, "fanmtl") == 0  # still re-checked next time -- the boundary moves
 
 
+def test_cmd_crawl_recovers_from_transient_empty_page(monkeypatch, db_path, tmp_path):
+    # Confirmed live (2026-08-03): a catalog page can fetch fine (HTTP 200)
+    # but parse to zero novels as a one-off (soft block/rate-limit), then
+    # recover on the very next request -- treating the first empty parse as
+    # final would silently truncate the crawl here.
+    monkeypatch.setattr(dataspine.time, "sleep", lambda secs: None)
+    page0 = fanmtl_catalog_html([("Novel A", "a1", 100, "Ongoing")])
+    attempts = {"n": 0}
+
+    def flaky_page1():
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return FakeResponse(fanmtl_catalog_html([]), 200, page_url(1))
+        return FakeResponse(fanmtl_catalog_html([("Novel B", "b1", 100, "Ongoing")]),
+                             200, page_url(1))
+
+    session = FakeSession({
+        page_url(0): FakeResponse(page0, 200, page_url(0)),
+        page_url(1): flaky_page1,
+        page_url(2): FakeResponse(fanmtl_catalog_html([]), 200, page_url(2)),
+    })
+    run_cli(monkeypatch, ["crawl", "--pacing-file", str(tmp_path / "pacing.json"),
+                          "--db", db_path], session)
+
+    assert attempts["n"] == 2  # one empty parse, one recovered retry
+    conn = init_db(db_path)
+    assert get_novel(conn, "fanmtl", f"{BASE_URL}/novel/a1.html") is not None
+    assert get_novel(conn, "fanmtl", f"{BASE_URL}/novel/b1.html") is not None
+
+
+def test_cmd_crawl_stops_without_falsely_marking_end_after_persistent_empty_page(
+        monkeypatch, db_path, tmp_path, capsys):
+    # 2026-08-03 incident: page 3909 parsed to zero once, got taken as "the
+    # end", and the run stopped ~1,400 pages (~42,000 novels) short of the
+    # catalog's real end (confirmed separately to be page 5323, signaled by
+    # a real 404 -- see test_cmd_crawl_stops_cleanly_on_404_without_retrying).
+    # A page that STAYS empty through every retry is still not proof of the
+    # real end, just of something wrong right now -- so this must not print
+    # the old "reached the end" claim, must not silently advance past the
+    # page, and must leave a concrete artifact instead of guessing.
+    monkeypatch.setattr(dataspine.time, "sleep", lambda secs: None)
+    monkeypatch.chdir(tmp_path)
+    page0 = fanmtl_catalog_html([("Novel A", "a1", 100, "Ongoing")])
+    empty_page1 = fanmtl_catalog_html([])
+    session = FakeSession({
+        page_url(0): FakeResponse(page0, 200, page_url(0)),
+        page_url(1): FakeResponse(empty_page1, 200, page_url(1)),
+    })
+    run_cli(monkeypatch, ["crawl", "--pacing-file", str(tmp_path / "pacing.json"),
+                          "--db", db_path], session)
+
+    out = capsys.readouterr().out
+    assert "reached the end of the catalog" not in out
+    assert "NOT treating this as the end" in out
+    conn = init_db(db_path)
+    assert get_next_page(conn, "fanmtl") == 1  # re-checked next run, not marked final
+    debug_file = tmp_path / "dataspine_crawl_debug.html"
+    assert debug_file.exists()
+    assert "novel-list" in debug_file.read_text()
+
+
 def test_cmd_metadata_fills_in_synopsis_for_pending_candidate(monkeypatch, db_path):
     page0 = fanmtl_catalog_html([("Porter's", "kks30150", 300, "Ongoing")])
     crawl_session = FakeSession({
@@ -161,6 +222,39 @@ def test_cmd_metadata_fills_in_synopsis_for_pending_candidate(monkeypatch, db_pa
 def test_cmd_metadata_no_pending_candidates_prints_message(monkeypatch, db_path, capsys):
     run_cli(monkeypatch, ["metadata", "--db", db_path], FakeSession({}))
     assert "No candidates pending" in capsys.readouterr().out
+
+
+def _fanmtl_index_with_synopsis(synopsis):
+    return (f'<html><body><div class="summary"><div class="content">'
+            f'<p>{synopsis}</p></div></div></body></html>')
+
+
+def test_cmd_metadata_workers_processes_all_candidates_without_crosstalk(monkeypatch, db_path):
+    # --workers > 1 routes each fetch through a thread pool -- the thing
+    # most likely to break is a race that assigns novel A's parsed metadata
+    # to novel B's DB row (or drops one entirely). 8 candidates through 4
+    # workers, each with a distinguishable synopsis, so any crosstalk shows
+    # up as a wrong/missing synopsis rather than needing to inspect timing.
+    entries = [(f"Novel {i}", f"n{i}", 100, "Ongoing") for i in range(8)]
+    page0 = fanmtl_catalog_html(entries)
+    crawl_session = FakeSession({
+        page_url(0): FakeResponse(page0, 200, page_url(0)),
+        page_url(1): FakeResponse(fanmtl_catalog_html([]), 200, page_url(1)),
+    })
+    run_cli(monkeypatch, ["crawl", "--db", db_path], crawl_session)
+
+    metadata_session = FakeSession({
+        f"{BASE_URL}/novel/n{i}.html": FakeResponse(
+            _fanmtl_index_with_synopsis(f"Synopsis for novel {i}."),
+            200, f"{BASE_URL}/novel/n{i}.html")
+        for i in range(8)
+    })
+    run_cli(monkeypatch, ["metadata", "--workers", "4", "--db", db_path], metadata_session)
+
+    conn = init_db(db_path)
+    for i in range(8):
+        novel = get_novel(conn, "fanmtl", f"{BASE_URL}/novel/n{i}.html")
+        assert novel["synopsis"] == f"Synopsis for novel {i}."
 
 
 def _crawl_one(monkeypatch, db_path, chapter_id, title="A Novel"):
@@ -271,6 +365,56 @@ def test_cmd_enrich_widens_pacer_on_429(monkeypatch, db_path, tmp_path):
     assert pacing["novelupdates"] > 2.5  # default enrich --delay, widened past it
 
 
+def test_cmd_enrich_resolves_after_sustained_429s_by_getting_a_fresh_session(
+        monkeypatch, db_path):
+    # 2026-08-03 incident: a real enrich run hit 429s continuously even after
+    # the pacer had already widened all the way to its MAX_INTERVAL ceiling
+    # -- proof the block was tied to the solved session's cumulative volume,
+    # not just request rate, so nothing short of a fresh session was ever
+    # going to clear it. 5 straight 429s (dataspine.MAX_CONSECUTIVE_429S)
+    # should trigger a re-solve rather than grinding forever at max pacing.
+    entries = [(f"Novel {i}", f"n{i}", 100, "Ongoing") for i in range(6)]
+    page0 = fanmtl_catalog_html(entries)
+    crawl_session = FakeSession({
+        page_url(0): FakeResponse(page0, 200, page_url(0)),
+        page_url(1): FakeResponse(fanmtl_catalog_html([]), 200, page_url(1)),
+    })
+    run_cli(monkeypatch, ["crawl", "--db", db_path], crawl_session)
+
+    series_url = f"{NU_BASE_URL}/series/novel-5/"
+    search_html = nu_search_html([("Novel 5", series_url)])
+    series_html = nu_series_html(title="Novel 5", associated_names=["Novel 5"])
+
+    call_count = {"n": 0}
+
+    def search_response():
+        call_count["n"] += 1
+        if call_count["n"] <= 5:
+            return FakeResponse("", 429, NU_AJAX_URL)
+        return FakeResponse(search_html, 200, NU_AJAX_URL)
+
+    nu_session = FakeSession({
+        NU_AJAX_URL: search_response,
+        series_url: FakeResponse(series_html, 200, series_url),
+    })
+
+    solve_calls = {"n": 0}
+
+    def fake_solve(*a, **kw):
+        solve_calls["n"] += 1
+        return nu_session
+
+    monkeypatch.setattr(dataspine.novelupdates, "solve_challenge_session", fake_solve)
+
+    run_cli(monkeypatch, ["enrich", "--db", db_path], FakeSession({}))
+
+    assert solve_calls["n"] == 2  # initial solve + one re-solve after 5 consecutive 429s
+    conn = init_db(db_path)
+    for i in range(5):  # the 5 that 429'd are left unresolved, not force-retried
+        assert get_novel(conn, "fanmtl", f"{BASE_URL}/novel/n{i}.html")["nu_resolution"] is None
+    assert get_novel(conn, "fanmtl", f"{BASE_URL}/novel/n5.html")["nu_resolution"] == "auto"
+
+
 def test_cmd_enrich_no_pending_candidates_prints_message(monkeypatch, db_path, capsys):
     run_cli(monkeypatch, ["enrich", "--db", db_path], FakeSession({}))
     assert "No candidates pending Novel Updates enrichment" in capsys.readouterr().out
@@ -333,6 +477,44 @@ def test_cmd_chapters_partial_failure_still_marks_processed(monkeypatch, db_path
 def test_cmd_chapters_no_pending_candidates_prints_message(monkeypatch, db_path, capsys):
     run_cli(monkeypatch, ["chapters", "--db", db_path], FakeSession({}))
     assert "No candidates pending a chapter sample" in capsys.readouterr().out
+
+
+def test_cmd_chapters_workers_processes_all_candidates_without_crosstalk(
+        monkeypatch, db_path, tmp_path):
+    # Same crosstalk concern as the metadata --workers test, but exercising
+    # scrape_chapters()'s own per-chapter loop from inside a worker thread
+    # (see cmd_chapters's --workers branch comment on why that's tolerated
+    # unlocked) -- each of 4 novels' 3 sampled chapters must land under the
+    # right novel_id, not a sibling's.
+    entries = [(f"Novel {i}", f"n{i}", 100, "Ongoing") for i in range(4)]
+    page0 = fanmtl_catalog_html(entries)
+    crawl_session = FakeSession({
+        page_url(0): FakeResponse(page0, 200, page_url(0)),
+        page_url(1): FakeResponse(fanmtl_catalog_html([]), 200, page_url(1)),
+    })
+    run_cli(monkeypatch, ["crawl", "--db", db_path], crawl_session)
+
+    responses = {
+        chapter_url(f"n{i}", n): FakeResponse(
+            fanmtl_chapter_html([f"Prose for novel {i} chapter {n}, long enough to keep."],
+                                 title=f"N{i}Ch{n}"),
+            200, chapter_url(f"n{i}", n))
+        for i in range(4) for n in range(1, 4)
+    }
+    session = FakeSession(responses)
+    run_cli(monkeypatch, ["chapters", "--count", "3", "--workers", "4",
+                          "--cache-dir", str(tmp_path / ".cache"), "--db", db_path], session)
+
+    conn = init_db(db_path)
+    for i in range(4):
+        novel = get_novel(conn, "fanmtl", f"{BASE_URL}/novel/n{i}.html")
+        assert novel["chapters_sampled_at"] is not None
+        rows = conn.execute(
+            "SELECT * FROM chapters WHERE novel_id = ? ORDER BY chapter_number", (novel["id"],)
+        ).fetchall()
+        assert [r["chapter_number"] for r in rows] == [1, 2, 3]
+        for r in rows:
+            assert r["body"] == f"Prose for novel {i} chapter {r['chapter_number']}, long enough to keep."
 
 
 def test_cmd_stats_prints_summary(monkeypatch, db_path, capsys):
