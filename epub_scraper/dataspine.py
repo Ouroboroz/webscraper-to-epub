@@ -17,7 +17,9 @@ Usage:
   python -m epub_scraper.dataspine chapters [--count N] [--limit N] [--delay SECS] [--workers N]
                                              [--pacing-file FILE] [--db FILE]
   python -m epub_scraper.dataspine embed [--limit N] [--model NAME] [--db FILE]
-  python -m epub_scraper.dataspine cluster [--umap-dims N] [--min-cluster-size N] [--db FILE]
+  python -m epub_scraper.dataspine cluster [--umap-dims N] [--min-cluster-size N]
+                                            [--outlier-min-cluster-size N]
+                                            [--outlier-max-cluster-fraction F] [--db FILE]
   python -m epub_scraper.dataspine tag-communities [--db FILE]
   python -m epub_scraper.dataspine stats [--db FILE]
 
@@ -674,7 +676,9 @@ def cmd_cluster(args):
     conn = init_db(args.db)
     try:
         n, n_clusters, n_outliers = corpus_structure.cluster_corpus(
-            conn, SITE_KEY, umap_dims=args.umap_dims, min_cluster_size=args.min_cluster_size)
+            conn, SITE_KEY, umap_dims=args.umap_dims, min_cluster_size=args.min_cluster_size,
+            outlier_min_cluster_size=args.outlier_min_cluster_size,
+            outlier_max_cluster_fraction=args.outlier_max_cluster_fraction)
     except ImportError as e:
         print(f"Could not cluster: {e}")
         print("Install requirements-ml.txt (umap-learn + hdbscan) first.")
@@ -811,6 +815,14 @@ def build_parser():
         "cluster", help="UMAP+HDBSCAN cluster every embedded candidate (Stage 1, full recompute)")
     p_cluster.add_argument("--umap-dims", type=int, default=8, metavar="N")
     p_cluster.add_argument("--min-cluster-size", type=int, default=30, metavar="N")
+    p_cluster.add_argument("--outlier-min-cluster-size", type=int, default=15, metavar="N",
+                            help="min_cluster_size for the second pass that re-clusters "
+                                 "leftover outliers on their own, looking for small niche "
+                                 "themes the main pass was too diluted to find (default: 15)")
+    p_cluster.add_argument("--outlier-max-cluster-fraction", type=float, default=0.05, metavar="F",
+                            help="Discard (keep as outliers) any second-pass cluster bigger "
+                                 "than this fraction of the leftover set -- it's the sign of "
+                                 "a density-chained artifact, not a real theme (default: 0.05)")
     p_cluster.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
     p_cluster.set_defaults(func=cmd_cluster)
 

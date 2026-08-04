@@ -52,7 +52,66 @@ def embed_synopses(conn, site_key, model_name=DEFAULT_EMBEDDING_MODEL, limit=Non
     return len(rows)
 
 
-def cluster_corpus(conn, site_key, umap_dims=8, min_cluster_size=30, random_state=42):
+def _recluster_outliers(reduced, cluster_ids, min_cluster_size=15, max_cluster_fraction=0.05):
+    """Second pass: re-cluster whatever the main HDBSCAN pass left as -1, on
+    its own. "Doesn't fit any cluster" only means each point individually
+    failed a density test against the WHOLE corpus -- it doesn't mean the
+    leftover points are all similar to each other, so real small niche
+    themes can still hide in there. Confirmed live (2026-08-03): re-
+    clustering a real corpus's ~60k leftover outliers surfaced a genuine
+    ~150-novel "NBA/basketball isekai" micro-genre, plus several ~20-50-
+    novel anime-crossover ones, that the full-corpus pass was too diluted
+    to ever separate out.
+
+    But re-clustering a point set this different in size/density from the
+    original corpus is unreliable taken at face value: HDBSCAN's distance
+    notion is relative to whatever data it's given, and with the dense main
+    clusters removed it readily density-chains almost everything remaining
+    into one giant, semantically incoherent mega-cluster (confirmed live:
+    eom selection found one such cluster covering 97% of the leftover
+    points, containing completely unrelated genres side by side -- cutting
+    it back out with `cluster_selection_method='leaf'` on the very same
+    points instead swung outliers from 0.8% to 89.6%, a two-orders-of-
+    magnitude gap that's itself the tell this isn't real structure).
+    Filtered out via max_cluster_fraction: any second-pass cluster bigger
+    than that fraction of the leftover set is treated as this artifact, not
+    a real theme, and stays -1. The real niche clusters found live were all
+    under 0.3% of the leftover set -- max_cluster_fraction defaults well
+    above that (0.05) rather than right at it, since the actual boundary
+    between "real niche" and "artifact" is a per-run judgment call, not a
+    hard mathematical line.
+
+    Returns a NEW cluster_ids array (input is not mutated) -- accepted
+    sub-cluster IDs start right after the highest ID already used by the
+    caller's main pass, so IDs stay globally unique across both passes."""
+    import hdbscan
+    import numpy as np
+
+    cluster_ids = np.array(cluster_ids, copy=True)
+    outlier_mask = cluster_ids == -1
+    n_outliers = int(outlier_mask.sum())
+    if n_outliers < min_cluster_size:
+        return cluster_ids
+
+    sub_labels = hdbscan.HDBSCAN(
+        min_cluster_size=min(min_cluster_size, n_outliers)).fit_predict(reduced[outlier_mask])
+
+    next_id = int(cluster_ids.max()) + 1 if (cluster_ids != -1).any() else 0
+    max_size = max_cluster_fraction * n_outliers
+    outlier_indices = np.flatnonzero(outlier_mask)
+
+    sub_ids, sub_counts = np.unique(sub_labels, return_counts=True)
+    for sub_id, count in zip(sub_ids, sub_counts):
+        if sub_id == -1 or count > max_size:
+            continue  # not a real sub-cluster, or the density-chained mega-cluster artifact
+        cluster_ids[outlier_indices[sub_labels == sub_id]] = next_id
+        next_id += 1
+
+    return cluster_ids
+
+
+def cluster_corpus(conn, site_key, umap_dims=8, min_cluster_size=30, random_state=42,
+                    outlier_min_cluster_size=15, outlier_max_cluster_fraction=0.05):
     """Full recompute of cluster_id (HDBSCAN over a UMAP_dims-dim UMAP
     reduction) plus a separate 2D umap_x/umap_y projection purely for
     visualization, for every candidate with a stored embedding.
@@ -79,7 +138,12 @@ def cluster_corpus(conn, site_key, umap_dims=8, min_cluster_size=30, random_stat
     certainly small/less-diverse-sample bias, not a baseline to chase.
     30 was the best of the swept values (60.0%->55.9% outliers, 268->113
     clusters vs. the old default of 10); going higher (50, 100) plateaued
-    with no further gain."""
+    with no further gain.
+
+    outlier_min_cluster_size/outlier_max_cluster_fraction: passed straight
+    through to a second pass over whatever's left as -1 after the main
+    clustering above -- see _recluster_outliers()'s docstring for why this
+    exists and how the defaults were chosen."""
     import hdbscan
     import numpy as np
     import umap
@@ -101,6 +165,8 @@ def cluster_corpus(conn, site_key, umap_dims=8, min_cluster_size=30, random_stat
 
     clusterer = hdbscan.HDBSCAN(min_cluster_size=min(min_cluster_size, len(novel_ids)))
     cluster_ids = clusterer.fit_predict(reduced)
+    cluster_ids = _recluster_outliers(reduced, cluster_ids, min_cluster_size=outlier_min_cluster_size,
+                                       max_cluster_fraction=outlier_max_cluster_fraction)
 
     viz_reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, random_state=random_state)
     coords_2d = viz_reducer.fit_transform(embeddings)
