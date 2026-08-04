@@ -52,7 +52,7 @@ def embed_synopses(conn, site_key, model_name=DEFAULT_EMBEDDING_MODEL, limit=Non
     return len(rows)
 
 
-def cluster_corpus(conn, site_key, umap_dims=8, min_cluster_size=10, random_state=42):
+def cluster_corpus(conn, site_key, umap_dims=8, min_cluster_size=30, random_state=42):
     """Full recompute of cluster_id (HDBSCAN over a UMAP_dims-dim UMAP
     reduction) plus a separate 2D umap_x/umap_y projection purely for
     visualization, for every candidate with a stored embedding.
@@ -66,7 +66,20 @@ def cluster_corpus(conn, site_key, umap_dims=8, min_cluster_size=10, random_stat
 
     Returns (n_novels, n_clusters, n_outliers) -- n_outliers is how many got
     HDBSCAN's -1 label (not noise to be dropped; a real "doesn't fit a
-    theme" signal worth keeping)."""
+    theme" signal worth keeping).
+
+    min_cluster_size=30: swept a real 12-config grid against the full
+    104,954-novel corpus (2026-08-03) -- metric (euclidean/cosine),
+    n_neighbors (15/30/50), min_cluster_size (10/30/50/100), explicit
+    min_samples. Outlier rate stayed in a 55-62% band across EVERY
+    combination (UMAP's spectral init failed on most of them too -- a
+    genuinely small eigengap, not a config artifact), so this is a real
+    property of the corpus at this scale, not a bug to tune away -- the
+    much lower outlier rate on the original 1,510-novel run was almost
+    certainly small/less-diverse-sample bias, not a baseline to chase.
+    30 was the best of the swept values (60.0%->55.9% outliers, 268->113
+    clusters vs. the old default of 10); going higher (50, 100) plateaued
+    with no further gain."""
     import hdbscan
     import numpy as np
     import umap

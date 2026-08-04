@@ -810,7 +810,7 @@ def build_parser():
     p_cluster = sub.add_parser(
         "cluster", help="UMAP+HDBSCAN cluster every embedded candidate (Stage 1, full recompute)")
     p_cluster.add_argument("--umap-dims", type=int, default=8, metavar="N")
-    p_cluster.add_argument("--min-cluster-size", type=int, default=10, metavar="N")
+    p_cluster.add_argument("--min-cluster-size", type=int, default=30, metavar="N")
     p_cluster.add_argument("--db", default=DEFAULT_DB_PATH, metavar="FILE")
     p_cluster.set_defaults(func=cmd_cluster)
 
