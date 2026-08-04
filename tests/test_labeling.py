@@ -1,8 +1,11 @@
 from epub_scraper.dataspine_db import (get_label, get_novel, init_db, recompute_candidates,
-                                        upsert_catalog_entry, upsert_embedding, upsert_label)
-from epub_scraper.labeling import (_interleave_proportionally, build_seed_queue,
+                                        upsert_catalog_entry, upsert_embedding, upsert_label,
+                                        upsert_metadata)
+from epub_scraper.labeling import (_interleave_proportionally, build_review_batch,
+                                    build_search_index, build_seed_queue, import_offline_labels,
                                     next_review_candidate, rank_by_uncertainty, record_label,
                                     search_novels, train_uncertainty_model)
+from epub_scraper.profile import MetadataResult
 from test_dataspine_db import make_entry
 
 SITE = "fanmtl"
@@ -386,3 +389,68 @@ def test_record_label_writes_through_upsert_label_and_commits(db_path):
     assert label["label"] == "drop"
     assert label["drop_chapter"] == 12
     assert label["source"] == "read"
+
+
+# -- build_search_index / build_review_batch / import_offline_labels ---------------
+
+def test_build_search_index_is_lightweight_and_covers_every_candidate(db_path):
+    conn = init_db(db_path)
+    a = _add_candidate(conn, "https://x/a.html", "A", cluster_id=0)
+    b = _add_candidate(conn, "https://x/b.html", "B", cluster_id=-1)
+
+    index = build_search_index(conn, SITE)
+
+    assert {row["id"] for row in index} == {a, b}
+    # Lightweight on purpose -- no synopsis/tags, see the function's own
+    # docstring on why the read-a-book flow doesn't need them.
+    assert set(index[0].keys()) == {"id", "title", "author", "status"}
+
+
+def test_build_review_batch_matches_seed_queue_and_carries_full_detail(db_path):
+    conn = init_db(db_path)
+    novel_id = _add_candidate(conn, "https://x/a.html", "A", cluster_id=0)
+    upsert_metadata(conn, SITE, "https://x/a.html",
+                     MetadataResult(synopsis="A real synopsis.", genres=["Cultivation"],
+                                     author="Some Author", alt_title=None, status="Ongoing",
+                                     rating=None))
+    conn.commit()
+
+    batch = build_review_batch(conn, SITE, total_target=10)
+
+    assert len(batch) == 1
+    row = batch[0]
+    assert row["id"] == novel_id
+    assert row["synopsis"] == "A real synopsis."
+    assert row["tags"] == ["Cultivation"]
+    assert row["cluster_id"] == 0
+
+
+def test_build_review_batch_excludes_already_labeled(db_path):
+    conn = init_db(db_path)
+    a = _add_candidate(conn, "https://x/a.html", "A", cluster_id=0)
+    _add_candidate(conn, "https://x/b.html", "B", cluster_id=0)
+    upsert_label(conn, a, "like", source="cold")
+    conn.commit()
+
+    batch = build_review_batch(conn, SITE, total_target=10)
+
+    assert a not in {row["id"] for row in batch}
+
+
+def test_import_offline_labels_writes_through_and_returns_count(db_path):
+    conn = init_db(db_path)
+    a = _add_candidate(conn, "https://x/a.html", "A", cluster_id=0)
+    b = _add_candidate(conn, "https://x/b.html", "B", cluster_id=0)
+
+    count = import_offline_labels(conn, [
+        {"novel_id": a, "label": "love", "source": "cold"},
+        {"novel_id": b, "label": "drop", "source": "read", "drop_chapter": 5},
+    ])
+
+    assert count == 2
+    conn2 = init_db(db_path)
+    assert get_label(conn2, a)["label"] == "love"
+    label_b = get_label(conn2, b)
+    assert label_b["label"] == "drop"
+    assert label_b["drop_chapter"] == 5
+    assert label_b["source"] == "read"
